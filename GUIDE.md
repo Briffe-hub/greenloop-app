@@ -86,13 +86,34 @@ Chaque livreur crée son compte au premier lancement (bouton *Créer un compte*)
 
 ## Prise en main (dans l'ordre)
 
-1. **Matériel** → crée tes types. Deux modes de suivi :
-   - *À l'unité (QR)* pour les caisses, bacs, gros matériel → puis **Générer des
-     unités** et **Imprimer les étiquettes QR** (bouton dédié) → colle une
-     étiquette sur chaque pièce.
-   - *Par quantité* pour la vaisselle, les couverts, les verres…
+1. **Matériel** → crée tes types. **Un QR par type** (pas un QR différent par
+   exemplaire) : « Caisse crocodile » = un QR, « Caisse Araven 20L » = un autre, etc.
+   - Le **code QR** est proposé automatiquement (bouton *Auto*) à partir du nom,
+     tu peux le modifier. Il est **stocké dans la base** sur le type : tu peux
+     donc réimprimer la même étiquette autant de fois que tu veux, à l'identique.
    - Renseigne le **prix de remplacement** : il sert au calcul de la facturation
      casse/perte.
+   - Les types sans QR (ex. vaisselle comptée en vrac) se sélectionnent à la main
+     dans le flux, sans scan.
+
+### Imprimer / réimprimer les étiquettes QR (imprimante Brother DK)
+
+Chaque exemplaire d'un type porte **la même étiquette**. Deux méthodes :
+
+- **Depuis l'app** : écran d'un type → *Imprimer les étiquettes* → choisis le
+  nombre d'exemplaires → *Imprimer* → sélectionne ton imprimante Brother et le
+  format de ton rouleau DK. Pratique pour une réimpression rapide.
+- **Brother P-touch Editor (recommandé pour du volume et de la réimpression à
+  volonté)** : sur l'écran **Matériel**, bouton **CSV** → tu obtiens un fichier
+  avec tous tes types et leurs codes. Dans P-touch Editor : *Fichier → Base de
+  données → Parcourir* (importe le CSV), crée **un objet code-barres de type QR**
+  lié à la colonne `code_qr`, ajoute le champ `nom` en texte, choisis ton étiquette
+  DK, et imprime avec le nombre de copies voulu. Le CSV se régénère à tout moment,
+  donc tu réimprimes n'importe quelle étiquette quand tu veux.
+
+> Le QR encode juste le **code texte** (ex. `GL-ARAVEN20`). L'image n'est jamais
+> stockée : elle est régénérée depuis le code, donc une réimpression est toujours
+> strictement identique à l'originale.
 2. **Clients** → ajoute tes clients (ou garde ceux d'exemple).
 3. **Prestations** → crée une prestation (client + date).
 4. Le jour J, sur le téléphone :
@@ -131,8 +152,9 @@ greenloop/
   hors-ligne peut être ajoutée en v2 si les zones de livraison sont mal couvertes.
 - **Facturation** : GreenLoop calcule et liste les montants à facturer. Le lien
   automatique vers la facturation Briffe pourra être branché ensuite.
-- **Modèle hybride** : caisses/gros matériel à l'unité (QR), vaisselle/ustensiles
-  par quantité — c'est le compromis retenu ensemble.
+- **Modèle QR par type** : un même QR pour tous les exemplaires d'un type ; on
+  scanne chaque caisse à la sortie (chaque scan = +1) puis au retour, et le
+  manquant = sortie − retour. Les types sans QR se comptent à la main.
 
 Des idées de suite : file d'attente hors-ligne, rôles livreur/admin, export du
 rapport en PDF, rattachement au dossier Briffe, photo de la casse jointe à la

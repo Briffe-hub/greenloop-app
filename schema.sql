@@ -66,7 +66,8 @@ create table if not exists public.materiel_types (
   id             uuid primary key default gen_random_uuid(),
   nom            text not null,
   categorie      text,                       -- ex: 'Caisses', 'Vaisselle', 'Ustensiles', 'Gros matériel'
-  suivi          text not null default 'quantite'
+  code_qr        text unique,                -- UN QR par type : code identique sur tous les exemplaires
+  suivi          text not null default 'quantite'  -- (hérité, conservé pour compat ; le suivi est par quantité)
                  check (suivi in ('unite', 'quantite')),
   unite          text default 'pièce',       -- libellé d'unité pour l'affichage
   prix_unitaire  numeric(10,2) not null default 0,  -- prix de remplacement (facturation casse/perte)
@@ -212,13 +213,13 @@ end $$;
 -- ============================================================================
 --  DONNÉES D'EXEMPLE (facultatif — supprime ce bloc si tu pars de zéro)
 -- ============================================================================
-insert into public.materiel_types (nom, categorie, suivi, unite, prix_unitaire) values
-  ('Caisse navette',        'Caisses',        'unite',    'caisse',  35.00),
-  ('Bac gastronorme inox',  'Gros matériel',  'unite',    'bac',     45.00),
-  ('Assiette plate',        'Vaisselle',      'quantite', 'pièce',    4.50),
-  ('Verre à eau',           'Vaisselle',      'quantite', 'pièce',    2.80),
-  ('Couvert (fourchette)',  'Ustensiles',     'quantite', 'pièce',    1.90),
-  ('Plat de service',       'Vaisselle',      'quantite', 'pièce',   12.00)
+insert into public.materiel_types (nom, categorie, code_qr, unite, prix_unitaire) values
+  ('Caisse navette',        'Caisses',        'GL-CAISSENAVETTE',  'caisse',  35.00),
+  ('Bac gastronorme inox',  'Gros matériel',  'GL-BACGASTRO',      'bac',     45.00),
+  ('Assiette plate',        'Vaisselle',      'GL-ASSIETTEPLATE',  'pièce',    4.50),
+  ('Verre à eau',           'Vaisselle',      'GL-VERREEAU',       'pièce',    2.80),
+  ('Couvert (fourchette)',  'Ustensiles',     'GL-COUVERTFOURCH',  'pièce',    1.90),
+  ('Plat de service',       'Vaisselle',      'GL-PLATSERVICE',    'pièce',   12.00)
 on conflict do nothing;
 
 insert into public.clients (nom, adresse, contact) values
@@ -226,20 +227,7 @@ insert into public.clients (nom, adresse, contact) values
   ('EDHEC Business School',  '24 Av. Gustave Delory, Roubaix',  'Accueil')
 on conflict do nothing;
 
--- Quelques unités de caisses avec QR (pour tester le scan)
-do $$
-declare
-  caisse_type uuid;
-  i int;
-begin
-  select id into caisse_type from public.materiel_types where nom = 'Caisse navette' limit 1;
-  if caisse_type is not null then
-    for i in 1..10 loop
-      insert into public.materiel_units (type_id, code, libelle)
-      values (caisse_type, 'GL-CAISSE-' || lpad(i::text, 6, '0'), 'Caisse navette n°' || i)
-      on conflict (code) do nothing;
-    end loop;
-  end if;
-end $$;
+-- Note : la table materiel_units existe pour compatibilité mais n'est plus
+-- utilisée — le suivi se fait par type + quantité, avec UN QR par type.
 
 -- Fin du schéma.

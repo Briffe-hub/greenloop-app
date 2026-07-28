@@ -54,12 +54,16 @@
     },
     clients: () => db.q("clients", (q) => q.eq("actif", true).order("nom")),
     types: () => db.q("materiel_types", (q) => q.eq("actif", true).order("categorie").order("nom")),
-    unitsByType: (id) => db.q("materiel_units", (q) => q.eq("type_id", id).order("code")),
-    unitByCode: async (code) => {
+    type: async (id) => {
+      const { data, error } = await sb.from("materiel_types").select("*").eq("id", id).single();
+      if (error) throw error;
+      return data;
+    },
+    typeByCode: async (code) => {
       const { data, error } = await sb
-        .from("materiel_units")
-        .select("*, materiel_types(*)")
-        .eq("code", code.trim())
+        .from("materiel_types")
+        .select("*")
+        .eq("code_qr", code.trim())
         .maybeSingle();
       if (error) throw error;
       return data;
@@ -284,40 +288,47 @@
   async function viewFlux(id, sens) {
     const p = await db.prestation(id);
     const types = await db.types();
-    const unitTypes = types.filter((t) => t.suivi === "unite");
-    const qtyTypes = types.filter((t) => t.suivi === "quantite");
     const label = sens === "sortie" ? "Sortie" : "Retour";
     const verb = sens === "sortie" ? "livrés" : "récupérés";
 
-    // panier : unités scannées (map code->unit) + quantités (map typeId->n)
-    const scanned = new Map();
-    const qtys = {};
-    qtyTypes.forEach((t) => (qtys[t.id] = 0));
+    // Modèle « un QR par type » : chaque scan incrémente la quantité du type.
+    const counts = {};
+    types.forEach((t) => (counts[t.id] = 0));
+    const byCode = {};
+    types.forEach((t) => { if (t.code_qr) byCode[t.code_qr.trim()] = t; });
+
+    // Regroupement par catégorie pour l'affichage
+    const byCat = {};
+    types.forEach((t) => ((byCat[t.categorie || "Autres"] ||= []).push(t)));
+
+    const lineHtml = (t) => `
+      <div class="mat-line" data-line="${t.id}">
+        <div class="name"><b>${esc(t.nom)}</b><small>${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR — saisie manuelle"}</small></div>
+        <div class="qty" data-type="${t.id}">
+          <button data-d="-1">−</button>
+          <input type="number" inputmode="numeric" value="0" min="0" data-qtyinput="${t.id}" />
+          <button data-d="1">＋</button>
+        </div>
+      </div>`;
 
     app.innerHTML =
       topbar(label + " · " + (p.libelle || ""), { back: "prestation/" + id }) +
       `<main>
-        <div class="section-title">1. Scanner les caisses / gros matériel</div>
         <div class="card">
           <div id="scanner-box"></div>
-          <div class="scan-hint" id="scan-hint">Vise un QR code…</div>
+          <div class="scan-hint" id="scan-hint">Scanne le QR d'une caisse… chaque scan = +1</div>
           <div class="field-row" style="margin-top:6px">
-            <input id="manual-code" placeholder="ou saisir un code (GL-CAISSE-…)" />
-            <button class="btn sm sec" id="manual-add" style="flex:0 0 auto">Ajouter</button>
+            <input id="manual-code" placeholder="ou saisir un code (GL-…)" />
+            <button class="btn sm sec" id="manual-add" style="flex:0 0 auto">+1</button>
           </div>
-          <div class="scan-feed" id="scan-feed"></div>
         </div>
 
-        <div class="section-title">2. Quantités (vaisselle, ustensiles…)</div>
-        <div class="card" id="qty-card">
-          ${qtyTypes.map((t) => `
-            <div class="mat-line">
-              <div class="name"><b>${esc(t.nom)}</b><small>${esc(t.categorie||"")}</small></div>
-              <div class="qty" data-type="${t.id}">
-                <button data-d="-1">−</button>
-                <input type="number" inputmode="numeric" value="0" min="0" data-qtyinput="${t.id}" />
-                <button data-d="1">＋</button>
-              </div>
+        <div class="section-title">Matériel ${verb}</div>
+        <div class="list" id="qty-card">
+          ${Object.keys(byCat).sort().map((cat) => `
+            <div class="card">
+              <div class="sub" style="font-weight:700;margin-bottom:4px">${esc(cat)}</div>
+              ${byCat[cat].map(lineHtml).join("")}
             </div>`).join("")}
         </div>
 
@@ -329,91 +340,72 @@
         </div>
       </main>`;
 
-    // -- stepper quantités
     const updateRecap = () => {
-      const nUnits = scanned.size;
-      const nQty = Object.values(qtys).reduce((a, b) => a + b, 0);
-      $("#recap").textContent = `${nUnits + nQty} pièce(s) ${verb}` + (nUnits ? ` · ${nUnits} caisse(s)` : "");
+      const n = Object.values(counts).reduce((a, b) => a + b, 0);
+      $("#recap").textContent = `${n} pièce(s) ${verb}`;
     };
+    const setCount = (tid, v) => {
+      counts[tid] = Math.max(0, v);
+      const input = $(`[data-qtyinput="${tid}"]`);
+      if (input) input.value = counts[tid];
+      updateRecap();
+    };
+    const flashLine = (tid) => {
+      const line = $(`[data-line="${tid}"]`);
+      if (!line) return;
+      line.style.transition = "background .1s";
+      line.style.background = "#dcfce7";
+      setTimeout(() => (line.style.background = ""), 350);
+    };
+
+    // steppers + saisie directe
     $("#qty-card").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-d]");
       if (!b) return;
-      const wrap = b.closest(".qty");
-      const tid = wrap.dataset.type;
-      const input = $(`[data-qtyinput="${tid}"]`);
-      let v = Math.max(0, (parseInt(input.value) || 0) + parseInt(b.dataset.d));
-      input.value = v; qtys[tid] = v; updateRecap();
+      const tid = b.closest(".qty").dataset.type;
+      setCount(tid, (counts[tid] || 0) + parseInt(b.dataset.d));
     });
     $("#qty-card").addEventListener("input", (e) => {
       const inp = e.target.closest("[data-qtyinput]");
       if (!inp) return;
-      const tid = inp.dataset.qtyinput;
-      qtys[tid] = Math.max(0, parseInt(inp.value) || 0); updateRecap();
+      counts[inp.dataset.qtyinput] = Math.max(0, parseInt(inp.value) || 0);
+      updateRecap();
     });
 
-    // -- ajout d'une unité scannée/saisie
-    const feed = $("#scan-feed");
-    async function addCode(code) {
+    // scan / saisie d'un code -> +1 sur le type correspondant
+    function addCode(code) {
       code = (code || "").trim();
       if (!code) return;
-      if (scanned.has(code)) {
-        beep(220); flashFeed(code, "dup", "déjà scanné");
+      const t = byCode[code];
+      const hint = $("#scan-hint");
+      if (!t) {
+        beep(160);
+        if (hint) hint.textContent = "❌ Code inconnu : " + code;
         return;
       }
-      const unit = await db.unitByCode(code).catch(() => null);
-      if (!unit) { beep(160); flashFeed(code, "err", "code inconnu"); return; }
-      scanned.set(code, unit);
+      setCount(t.id, (counts[t.id] || 0) + 1);
+      flashLine(t.id);
       beep(660);
-      renderFeed();
-      updateRecap();
+      if (hint) hint.textContent = `✅ ${t.nom} : ${counts[t.id]}`;
+      // amène la ligne à l'écran
+      const line = $(`[data-line="${t.id}"]`);
+      if (line) line.scrollIntoView({ block: "center", behavior: "smooth" });
     }
-    function renderFeed() {
-      feed.innerHTML = Array.from(scanned.values())
-        .map(
-          (u) => `<div class="scan-item"><span>✅</span><span class="grow">${esc(u.libelle || (u.materiel_types && u.materiel_types.nom) || u.code)}</span>
-            <span class="sub">${esc(u.code)}</span>
-            <button class="btn sm ghost" data-rm="${esc(u.code)}" style="padding:4px 8px">✕</button></div>`
-        )
-        .join("");
-    }
-    function flashFeed(code, cls, msg) {
-      const div = document.createElement("div");
-      div.className = "scan-item " + cls;
-      div.innerHTML = `<span>${cls === "dup" ? "⚠️" : "❌"}</span><span class="grow">${esc(code)}</span><span class="sub">${msg}</span>`;
-      feed.prepend(div);
-      setTimeout(() => div.remove(), 1800);
-    }
-    feed.addEventListener("click", (e) => {
-      const b = e.target.closest("[data-rm]");
-      if (b) { scanned.delete(b.dataset.rm); renderFeed(); updateRecap(); }
-    });
     $("#manual-add").onclick = () => { addCode($("#manual-code").value); $("#manual-code").value = ""; };
     $("#manual-code").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#manual-add").click(); });
 
-    // -- scanner caméra
     startScanner(addCode);
 
-    // -- validation
     $("#valider").onclick = async () => {
       const rows = [];
-      scanned.forEach((u) => rows.push({
-        prestation_id: id, sens, type_id: u.type_id, unit_id: u.id, quantite: 1, par_user: state.user.id,
-      }));
-      qtyTypes.forEach((t) => {
-        if (qtys[t.id] > 0)
-          rows.push({ prestation_id: id, sens, type_id: t.id, unit_id: null, quantite: qtys[t.id], par_user: state.user.id });
+      types.forEach((t) => {
+        if (counts[t.id] > 0)
+          rows.push({ prestation_id: id, sens, type_id: t.id, unit_id: null, quantite: counts[t.id], par_user: state.user.id });
       });
       if (!rows.length) return toast("Rien à valider", "err");
       $("#valider").disabled = true;
       const { error } = await sb.from("mouvements").insert(rows);
       if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
-      // maj statut des unités
-      const unitIds = Array.from(scanned.values()).map((u) => u.id);
-      if (unitIds.length) {
-        await sb.from("materiel_units")
-          .update({ statut: sens === "sortie" ? "sorti" : "disponible" })
-          .in("id", unitIds);
-      }
       stopScanner();
       toast(label + " enregistrée ✔", "ok");
       go("prestation/" + id);
@@ -469,18 +461,12 @@
   async function viewManquants(id) {
     const p = await db.prestation(id);
     const bilan = await db.bilan(id);
-    const mvts = await db.mouvements(id);
     const facts = await db.facturations(id);
 
     // cache des noms de types (défini AVANT de construire le HTML)
     const typeMap = {};
     (await db.types()).forEach((t) => (typeMap[t.id] = t));
     const typeName = (tid) => (typeMap[tid] ? typeMap[tid].nom : "Matériel");
-
-    // unités précises manquantes (sorties mais pas revenues)
-    const outUnits = new Set(mvts.filter((m) => m.sens === "sortie" && m.unit_id).map((m) => m.unit_id));
-    const backUnits = new Set(mvts.filter((m) => m.sens === "retour" && m.unit_id).map((m) => m.unit_id));
-    const missingUnitIds = [...outUnits].filter((u) => !backUnits.has(u));
 
     const manquants = bilan.filter((b) => b.q_manquant > 0);
     const totalFact = facts.filter((f) => f.statut !== "annule").reduce((s, f) => s + Number(f.montant), 0);
@@ -504,9 +490,6 @@
                 </div>
               </div>`).join("")
         }
-
-        ${missingUnitIds.length ? `<div class="section-title">Caisses/unités précises non revenues</div>
-          <div class="card"><div class="sub">${missingUnitIds.length} unité(s) tracée(s) toujours dehors.</div></div>` : ""}
 
         ${facts.length ? `<div class="section-title">Facturations enregistrées — total ${eur(totalFact)}</div>` +
           facts.map((f) => `<div class="card"><div class="row between">
@@ -544,89 +527,108 @@
       ${byCat[cat].map((t) => `
         <div class="card tap" onclick="location.hash='#/type/${t.id}'">
           <div class="grow"><h3>${esc(t.nom)}</h3>
-            <div class="sub">${t.suivi==="unite"?"🏷️ Suivi à l'unité (QR)":"🔢 Suivi par quantité"} · ${eur(t.prix_unitaire)}/u</div></div>
+            <div class="sub">${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR"} · ${eur(t.prix_unitaire)}/u</div></div>
           <div style="font-size:22px;color:#cbd5c9">›</div>
         </div>`).join("")}
     `).join("");
 
     app.innerHTML =
-      topbar("Matériel") +
-      `<main>${types.length ? body : '<div class="empty"><div class="big">📦</div>Aucun matériel.</div>'}</main>
+      topbar("Matériel", { action: "⬇︎ CSV" }) +
+      `<main>
+        ${types.length ? body : '<div class="empty"><div class="big">📦</div>Aucun matériel.</div>'}
+        <div class="sub no-print" style="margin-top:16px">Le bouton « CSV » exporte tous les types + leur code QR, pour générer/réimprimer les étiquettes en lot dans Brother P-touch Editor.</div>
+      </main>
        <button class="fab" onclick="location.hash='#/type/new'">＋</button>`;
+    const csvBtn = $("#tb-action");
+    if (csvBtn) csvBtn.onclick = () => exportTypesCSV(types);
+  }
+
+  // Export CSV (nom;categorie;code_qr;prix) pour fusion Brother P-touch Editor
+  function exportTypesCSV(types) {
+    const head = "nom;categorie;code_qr;prix_remplacement";
+    const lines = types.map((t) =>
+      [t.nom, t.categorie || "", t.code_qr || "", String(t.prix_unitaire).replace(".", ",")]
+        .map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(";")
+    );
+    const csv = "﻿" + [head, ...lines].join("\r\n"); // BOM pour Excel/Brother
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "greenloop-materiel.csv";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }
+
+  // Génère un code lisible à partir d'un nom (ex "Caisse Araven 20L" -> "GL-CAISSEARAVEN20L")
+  function slugCode(nom) {
+    const base = (nom || "")
+      .normalize("NFD").replace(/[̀-ͯ]/g, "")   // enlève les accents
+      .toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 18);
+    return "GL-" + (base || "MAT");
   }
 
   async function viewTypeDetail(tid) {
     const isNew = tid === "new";
-    let t = { nom: "", categorie: "", suivi: "quantite", unite: "pièce", prix_unitaire: 0 };
-    let units = [];
-    if (!isNew) {
-      const { data } = await sb.from("materiel_types").select("*").eq("id", tid).single();
-      t = data;
-      if (t.suivi === "unite") units = await db.unitsByType(tid);
-    }
+    let t = { nom: "", categorie: "", unite: "pièce", prix_unitaire: 0, code_qr: "" };
+    if (!isNew) t = await db.type(tid);
+
     app.innerHTML =
       topbar(isNew ? "Nouveau matériel" : t.nom, { back: "materiel" }) +
       `<main>
         <div class="card">
-          <label>Nom</label><input id="t-nom" value="${esc(t.nom)}" placeholder="Ex : Assiette plate" />
-          <label>Catégorie</label><input id="t-cat" value="${esc(t.categorie||"")}" placeholder="Vaisselle, Caisses…" />
+          <label>Nom</label><input id="t-nom" value="${esc(t.nom)}" placeholder="Ex : Caisse Araven 20L" />
+          <label>Catégorie</label><input id="t-cat" value="${esc(t.categorie||"")}" placeholder="Caisses, Vaisselle…" />
+          <label>Prix de remplacement (€) — sert à la facturation casse/perte</label>
+          <input id="t-prix" type="number" step="0.01" value="${t.prix_unitaire}" />
+          <label>Code QR (identique sur tous les exemplaires de ce type)</label>
           <div class="field-row">
-            <div><label>Type de suivi</label>
-              <select id="t-suivi">
-                <option value="quantite" ${t.suivi==="quantite"?"selected":""}>Par quantité</option>
-                <option value="unite" ${t.suivi==="unite"?"selected":""}>À l'unité (QR)</option>
-              </select></div>
-            <div><label>Prix remplacement (€)</label><input id="t-prix" type="number" step="0.01" value="${t.prix_unitaire}" /></div>
+            <input id="t-code" value="${esc(t.code_qr||"")}" placeholder="GL-…" style="font-family:monospace" />
+            <button class="btn sm sec" id="gen-code" style="flex:0 0 auto">Auto</button>
           </div>
           <button class="btn block" id="save">${isNew?"Créer":"Enregistrer"}</button>
         </div>
 
-        ${!isNew && t.suivi==="unite" ? `
-          <div class="section-title">Unités (${units.length}) — QR</div>
-          <div class="card">
-            <div class="field-row">
-              <input id="nb-units" type="number" value="5" min="1" placeholder="Nombre" />
-              <button class="btn sm sec" id="gen-units" style="flex:0 0 auto">Générer des unités</button>
-            </div>
-            ${units.length ? `<button class="btn ghost block" onclick="location.hash='#/etiquettes/${tid}'">🖨️ Imprimer les étiquettes QR</button>` : ""}
-            <div style="margin-top:8px">
-              ${units.map((u)=>`<div class="mat-line"><div class="name"><b>${esc(u.code)}</b><small>${esc(u.libelle||"")} · ${u.statut}</small></div></div>`).join("")}
-            </div>
+        ${!isNew && t.code_qr ? `
+          <div class="card" style="text-align:center">
+            <div id="qr-preview" style="display:flex;justify-content:center;margin:6px 0"></div>
+            <div class="code">${esc(t.code_qr)}</div>
+            <button class="btn ghost block" onclick="location.hash='#/etiquettes/${tid}'">🖨️ Imprimer les étiquettes (choisir le nombre)</button>
           </div>` : ""}
       </main>`;
 
-    $("#save").onclick = async () => {
-      const payload = {
-        nom: $("#t-nom").value.trim(),
-        categorie: $("#t-cat").value.trim() || null,
-        suivi: $("#t-suivi").value,
-        prix_unitaire: parseFloat($("#t-prix").value) || 0,
-      };
-      if (!payload.nom) return toast("Ajoute un nom", "err");
-      if (isNew) {
-        const { data, error } = await sb.from("materiel_types").insert(payload).select().single();
-        if (error) return toast(error.message, "err");
-        go("type/" + data.id);
-      } else {
-        const { error } = await sb.from("materiel_types").update(payload).eq("id", tid);
-        toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
-        if (!error) render();
-      }
-    };
+    // aperçu du QR
+    const prev = $("#qr-preview");
+    if (prev && t.code_qr) new QRCode(prev, { text: t.code_qr, width: 130, height: 130, correctLevel: QRCode.CorrectLevel.M });
 
-    const gen = $("#gen-units");
-    if (gen) gen.onclick = async () => {
-      const n = Math.max(1, parseInt($("#nb-units").value) || 1);
-      const start = units.length;
-      const prefix = "GL-" + (t.nom.slice(0, 6).toUpperCase().replace(/[^A-Z]/g, "") || "MAT") + "-";
-      const rows = [];
-      for (let i = 1; i <= n; i++) {
-        const num = start + i;
-        rows.push({ type_id: tid, code: prefix + String(num).padStart(5, "0"), libelle: t.nom + " n°" + num });
+    $("#gen-code").onclick = () => { $("#t-code").value = slugCode($("#t-nom").value); };
+
+    $("#save").onclick = async () => {
+      const nom = $("#t-nom").value.trim();
+      if (!nom) return toast("Ajoute un nom", "err");
+      let code = $("#t-code").value.trim();
+      if (!code) code = slugCode(nom);            // auto si vide
+      const payload = {
+        nom,
+        categorie: $("#t-cat").value.trim() || null,
+        prix_unitaire: parseFloat($("#t-prix").value) || 0,
+        code_qr: code || null,
+      };
+      $("#save").disabled = true;
+      let error;
+      if (isNew) {
+        const res = await sb.from("materiel_types").insert(payload).select().single();
+        error = res.error;
+        if (!error) return go("type/" + res.data.id);
+      } else {
+        error = (await sb.from("materiel_types").update(payload).eq("id", tid)).error;
       }
-      const { error } = await sb.from("materiel_units").insert(rows);
-      toast(error ? error.message : n + " unité(s) créée(s) ✔", error ? "err" : "ok");
-      if (!error) render();
+      $("#save").disabled = false;
+      if (error) {
+        return toast(error.message.includes("duplicate") || error.code === "23505"
+          ? "Ce code QR est déjà utilisé par un autre type" : error.message, "err");
+      }
+      toast("Enregistré ✔", "ok");
+      render();
     };
   }
 
@@ -634,25 +636,45 @@
   //  VUE : Étiquettes QR imprimables
   // =========================================================================
   async function viewEtiquettes(tid) {
-    const { data: t } = await sb.from("materiel_types").select("*").eq("id", tid).single();
-    const units = await db.unitsByType(tid);
+    const t = await db.type(tid);
+    if (!t.code_qr) {
+      app.innerHTML = topbar("Étiquettes", { back: "type/" + tid }) +
+        `<main><div class="card">Ce type n'a pas encore de code QR. Reviens en arrière et clique « Auto » pour en générer un.</div></main>`;
+      return;
+    }
     app.innerHTML =
       topbar("Étiquettes · " + t.nom, { back: "type/" + tid, action: "🖨️ Imprimer" }) +
       `<main>
-        <div class="sub no-print">Imprime cette page, découpe et colle une étiquette sur chaque ${esc(t.unite||"pièce")}.</div>
+        <div class="card no-print">
+          <div class="sub">Toutes les étiquettes de « ${esc(t.nom)} » portent le même QR (<b>${esc(t.code_qr)}</b>).
+          Choisis combien d'exemplaires imprimer, puis colles-en une sur chaque caisse.</div>
+          <label>Nombre d'étiquettes</label>
+          <div class="field-row">
+            <input id="nb" type="number" value="10" min="1" max="200" />
+            <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
+          </div>
+          <div class="sub" style="margin-top:8px">💡 Pour ton imprimante Brother (rouleaux DK) : soit tu imprimes cette page directement en choisissant l'imprimante Brother, soit tu utilises le CSV (écran Matériel) dans P-touch Editor pour régler le nombre de copies.</div>
+        </div>
         <div class="labels" id="labels"></div>
       </main>`;
     $("#tb-action").onclick = () => window.print();
-    const box = $("#labels");
-    units.forEach((u) => {
-      const div = document.createElement("div");
-      div.className = "label";
-      const qr = document.createElement("div");
-      div.appendChild(qr);
-      div.insertAdjacentHTML("beforeend", `<div class="lib">${esc(u.libelle || t.nom)}</div><div class="code">${esc(u.code)}</div>`);
-      box.appendChild(div);
-      new QRCode(qr, { text: u.code, width: 120, height: 120, correctLevel: QRCode.CorrectLevel.M });
-    });
+
+    const render = () => {
+      const n = Math.min(200, Math.max(1, parseInt($("#nb").value) || 1));
+      const box = $("#labels");
+      box.innerHTML = "";
+      for (let i = 0; i < n; i++) {
+        const div = document.createElement("div");
+        div.className = "label";
+        const qr = document.createElement("div");
+        div.appendChild(qr);
+        div.insertAdjacentHTML("beforeend", `<div class="lib">${esc(t.nom)}</div><div class="code">${esc(t.code_qr)}</div>`);
+        box.appendChild(div);
+        new QRCode(qr, { text: t.code_qr, width: 120, height: 120, correctLevel: QRCode.CorrectLevel.M });
+      }
+    };
+    $("#apply").onclick = render;
+    render();
   }
 
   // =========================================================================
