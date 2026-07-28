@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1" />
+  <meta name="theme-color" content="#166534" />
+  <title>GreenLoop — Traçabilité matériel</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Librairies (hébergées dans le projet, aucune dépendance CDN) -->
+  <script src="lib/supabase.js"></script>
+  <script src="lib/html5-qrcode.min.js"></script>
+  <script src="lib/qrcode.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div class="boot">Chargement de GreenLoop…</div>
+  </div>
+
+  <!-- Barre de navigation (masquée tant qu'on n'est pas connecté) -->
+  <nav id="nav" class="nav hidden">
+    <button data-route="prestations"><span class="ico">📋</span>Prestations</button>
+    <button data-route="materiel"><span class="ico">📦</span>Matériel</button>
+    <button data-route="clients"><span class="ico">🏢</span>Clients</button>
+    <button data-route="compte"><span class="ico">👤</span>Compte</button>
+  </nav>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
