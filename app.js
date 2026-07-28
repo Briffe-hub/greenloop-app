@@ -53,6 +53,19 @@
       return data;
     },
     clients: () => db.q("clients", (q) => q.eq("actif", true).order("nom")),
+    client: async (id) => {
+      const { data, error } = await sb.from("clients").select("*").eq("id", id).single();
+      if (error) throw error;
+      return data;
+    },
+    soldeClient: (cid) => db.q("v_solde_client", (q) => q.eq("client_id", cid)),
+    prestationsByClient: (cid) =>
+      db.q("prestations", (q) => q.eq("client_id", cid).order("date_presta", { ascending: false })),
+    param: async (cle) => {
+      const { data } = await sb.from("parametres").select("valeur").eq("cle", cle).maybeSingle();
+      return data ? data.valeur : "";
+    },
+    setParam: (cle, valeur) => sb.from("parametres").upsert({ cle, valeur }),
     types: () => db.q("materiel_types", (q) => q.eq("actif", true).order("categorie").order("nom")),
     type: async (id) => {
       const { data, error } = await sb.from("materiel_types").select("*").eq("id", id).single();
@@ -119,6 +132,12 @@
       if (head === "type") return viewTypeDetail(parts[1]);
       if (head === "etiquettes") return viewEtiquettes(parts[1]);
       if (head === "clients") return viewClients();
+      if (head === "client") {
+        if (parts[1] === "new") return viewClientForm("new");
+        if (parts[2] === "edit") return viewClientForm(parts[1]);
+        return viewClientDetail(parts[1]);
+      }
+      if (head === "parametres") return viewParametres();
       if (head === "compte") return viewCompte();
       go("prestations");
     } catch (e) {
@@ -246,8 +265,8 @@
         <div class="card">
           <div class="row between">
             <div class="grow">
-              <h3>${esc(p.clients ? p.clients.nom : "Client ?")}</h3>
-              <div class="sub">${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}</div>
+              <h3 style="cursor:pointer" ${p.client_id ? `onclick="location.hash='#/client/${p.client_id}'"` : ""}>${esc(p.clients ? p.clients.nom : "Client ?")}</h3>
+              <div class="sub">${p.clients ? (p.clients.type_client === "fixe" ? "Client fixe · " : "Client ponctuel · ") : ""}${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}</div>
             </div>
             ${prestaBadge(p.statut)}
           </div>
@@ -476,7 +495,8 @@
       `<main>
         ${manquants.length === 0
           ? `<div class="card" style="text-align:center"><div style="font-size:34px">✅</div><b>Tout est revenu !</b><div class="sub">Aucun matériel manquant sur cette prestation.</div></div>`
-          : `<div class="section-title">À réclamer / facturer</div>` +
+          : `<button class="btn block" id="mail-compta">✉️ Envoyer les manquants à la compta</button>
+             <div class="section-title">À réclamer / facturer</div>` +
             manquants.map((b) => `
               <div class="card">
                 <div class="row between">
@@ -497,6 +517,25 @@
               <span class="badge ${f.statut==="facture"?"green":f.statut==="annule"?"gray":"amber"}">${f.statut.replace("_"," ")}</span>
             </div></div>`).join("") : ""}
       </main>`;
+
+    const mailBtn = $("#mail-compta");
+    if (mailBtn) mailBtn.onclick = async () => {
+      const compta = await db.param("email_compta");
+      if (!compta) return toast("Renseigne l'email de la compta dans Paramètres", "err");
+      const cli = p.clients ? p.clients.nom : "Client ?";
+      const lignes = manquants.map((b) => `- ${b.type_nom} : ${b.q_manquant} manquant(s) (${eur(b.q_manquant * b.prix_unitaire)})`).join("\n");
+      const total = manquants.reduce((s, b) => s + b.q_manquant * b.prix_unitaire, 0);
+      const body =
+`Prestation : ${p.libelle || ""}
+Client : ${cli}
+Date : ${dfr(p.date_presta)}
+
+Matériel manquant à facturer :
+${lignes}
+
+Total : ${eur(total)}`;
+      openMail(compta, `Manquants à facturer — ${cli} (${p.libelle || ""})`, body);
+    };
 
     $$("[data-fact]").forEach((btn) => {
       btn.onclick = async () => {
@@ -678,31 +717,212 @@
   }
 
   // =========================================================================
-  //  VUE : Clients
+  //  Emails (récap) — via le client mail (mailto)
+  // =========================================================================
+  function openMail(to, subject, body) {
+    const url = "mailto:" + encodeURIComponent(to || "") +
+      "?subject=" + encodeURIComponent(subject) +
+      "&body=" + encodeURIComponent(body);
+    window.location.href = url;
+  }
+  const clientBadge = (t) =>
+    t === "fixe" ? '<span class="badge blue">Fixe</span>' : '<span class="badge gray">Ponctuel</span>';
+
+  // =========================================================================
+  //  VUE : Clients (annuaire)
   // =========================================================================
   async function viewClients() {
     const clients = await db.clients();
+    const cards = clients.length
+      ? clients.map((c) => `
+        <div class="card tap" onclick="location.hash='#/client/${c.id}'">
+          <div class="grow">
+            <div class="row between"><h3 class="truncate">${esc(c.nom)}</h3>${clientBadge(c.type_client)}</div>
+            <div class="sub">${esc(c.adresse || "")}${c.contact ? " · " + esc(c.contact) : ""}</div>
+          </div>
+          <div style="font-size:22px;color:#cbd5c9">›</div>
+        </div>`).join("")
+      : '<div class="empty"><div class="big">🏢</div>Aucun client.</div>';
     app.innerHTML =
       topbar("Clients") +
+      `<main>${cards}</main>
+       <button class="fab" onclick="location.hash='#/client/new'">＋</button>`;
+  }
+
+  // =========================================================================
+  //  VUE : Fiche client (solde détenu + récap + facturation)
+  // =========================================================================
+  async function viewClientDetail(id) {
+    const c = await db.client(id);
+    const solde = await db.soldeClient(id);
+    const totalPieces = solde.reduce((s, x) => s + x.solde, 0);
+    const totalValeur = solde.reduce((s, x) => s + x.solde * Number(x.prix_unitaire), 0);
+    const fixe = c.type_client === "fixe";
+
+    app.innerHTML =
+      topbar(c.nom, { back: "clients", action: "Modifier" }) +
       `<main>
-        ${clients.map((c) => `<div class="card"><h3>${esc(c.nom)}</h3><div class="sub">${esc(c.adresse||"")}${c.contact?" · "+esc(c.contact):""}</div></div>`).join("")
-          || '<div class="empty"><div class="big">🏢</div>Aucun client.</div>'}
-        <div class="section-title">Ajouter un client</div>
         <div class="card">
-          <label>Nom</label><input id="c-nom" placeholder="Nom du client" />
-          <label>Adresse</label><input id="c-adr" placeholder="Adresse de livraison" />
-          <label>Contact</label><input id="c-contact" placeholder="Personne / service" />
-          <button class="btn block" id="c-save">Ajouter</button>
+          <div class="row between">
+            <div class="grow">
+              <div class="sub">${esc(c.adresse || "")}</div>
+              <div class="sub">${c.contact ? esc(c.contact) : ""}${c.email ? " · " + esc(c.email) : ""}${c.telephone ? " · " + esc(c.telephone) : ""}</div>
+            </div>
+            ${clientBadge(c.type_client)}
+          </div>
+        </div>
+
+        <div class="section-title">Matériel détenu à l'instant T</div>
+        ${solde.length === 0
+          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Ce client ne détient aucun matériel.</div>`
+          : `<div class="card">
+              ${solde.map((x) => `
+                <div class="mat-line">
+                  <div class="name"><b>${esc(x.type_nom)}</b><small>${esc(x.categorie || "")} · ${eur(x.prix_unitaire)}/u</small></div>
+                  <span class="badge ${x.solde > 0 ? "amber" : "green"}">${x.solde}</span>
+                </div>`).join("")}
+              <div class="divider"></div>
+              <div class="row between"><b>${totalPieces} pièce(s)</b><b>${eur(totalValeur)}</b></div>
+            </div>`}
+
+        ${solde.length ? `
+          <button class="btn block" id="recap">✉️ ${fixe ? "Envoyer le récap au client" : "Envoyer les manquants à la compta"}</button>
+          <button class="btn warn block" id="facturer">💶 Facturer ce matériel (perte/casse)</button>
+        ` : ""}
+
+        <div class="section-title">Prestations</div>
+        <div class="card" id="prestas"><div class="sub">Chargement…</div></div>
+      </main>`;
+
+    $("#tb-action").onclick = () => go("client/" + id + "/edit");
+
+    // liste des prestations du client
+    const prestas = await db.prestationsByClient(id);
+    $("#prestas").innerHTML = prestas.length
+      ? prestas.map((p) => `<div class="mat-line" onclick="location.hash='#/prestation/${p.id}'" style="cursor:pointer">
+          <div class="name"><b>${esc(p.libelle || "Prestation")}</b><small>${dfr(p.date_presta)}</small></div>
+          <div style="color:#cbd5c9">›</div></div>`).join("")
+      : '<div class="sub">Aucune prestation.</div>';
+
+    // récap par email
+    const recapBtn = $("#recap");
+    if (recapBtn) recapBtn.onclick = async () => {
+      const lignes = solde.map((x) => `- ${x.type_nom} : ${x.solde}`).join("\n");
+      if (fixe) {
+        if (!c.email) return toast("Ce client n'a pas d'email — ajoute-le via Modifier", "err");
+        const body =
+`Bonjour,
+
+Voici le récapitulatif du matériel BRIFFE actuellement en votre possession :
+
+${lignes}
+
+Total : ${totalPieces} pièce(s), valeur de remplacement ${eur(totalValeur)}.
+
+Merci de nous signaler tout élément manquant, cassé ou perdu afin de régulariser.
+
+Bien cordialement,
+L'équipe BRIFFE`;
+        openMail(c.email, `Récapitulatif matériel BRIFFE — ${c.nom}`, body);
+      } else {
+        const compta = await db.param("email_compta");
+        if (!compta) return toast("Renseigne l'email de la compta dans Paramètres", "err");
+        const body =
+`Matériel non restitué par le client ${c.nom} :
+
+${lignes}
+
+Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} à facturer.`;
+        openMail(compta, `Matériel à facturer — ${c.nom}`, body);
+      }
+    };
+
+    // facturation (niveau client)
+    const factBtn = $("#facturer");
+    if (factBtn) factBtn.onclick = async () => {
+      factBtn.disabled = true;
+      const rows = solde.filter((x) => x.solde > 0).map((x) => ({
+        client_id: id, prestation_id: null, type_id: x.type_id,
+        motif: "perte", quantite: x.solde, prix_unitaire: x.prix_unitaire, statut: "a_facturer",
+      }));
+      if (!rows.length) { factBtn.disabled = false; return toast("Rien à facturer", "err"); }
+      const { error } = await sb.from("facturations").insert(rows);
+      factBtn.disabled = false;
+      toast(error ? error.message : `${rows.length} ligne(s) ajoutée(s) à facturer ✔`, error ? "err" : "ok");
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Créer / modifier un client
+  // =========================================================================
+  async function viewClientForm(id) {
+    const isNew = id === "new";
+    let c = { nom: "", type_client: "ponctuel", adresse: "", contact: "", email: "", telephone: "", sextan_id: "" };
+    if (!isNew) c = await db.client(id);
+    app.innerHTML =
+      topbar(isNew ? "Nouveau client" : "Modifier — " + c.nom, { back: isNew ? "clients" : "client/" + id }) +
+      `<main>
+        <div class="card">
+          <label>Nom</label><input id="c-nom" value="${esc(c.nom)}" placeholder="Nom du client" />
+          <label>Type de client</label>
+          <select id="c-type">
+            <option value="ponctuel" ${c.type_client === "ponctuel" ? "selected" : ""}>Ponctuel (tout revient au débarrassage)</option>
+            <option value="fixe" ${c.type_client === "fixe" ? "selected" : ""}>Fixe (garde du matériel d'une fois sur l'autre)</option>
+          </select>
+          <label>Adresse</label><input id="c-adr" value="${esc(c.adresse || "")}" placeholder="Adresse de livraison" />
+          <label>Contact</label><input id="c-contact" value="${esc(c.contact || "")}" placeholder="Personne / service" />
+          <div class="field-row">
+            <div><label>Email</label><input id="c-email" type="email" value="${esc(c.email || "")}" placeholder="pour le récap" /></div>
+            <div><label>Téléphone</label><input id="c-tel" value="${esc(c.telephone || "")}" /></div>
+          </div>
+          <label>ID Sextan (optionnel)</label><input id="c-sextan" value="${esc(c.sextan_id || "")}" />
+          <button class="btn block" id="save">${isNew ? "Créer" : "Enregistrer"}</button>
         </div>
       </main>`;
-    $("#c-save").onclick = async () => {
+    $("#save").onclick = async () => {
       const nom = $("#c-nom").value.trim();
       if (!nom) return toast("Ajoute un nom", "err");
-      const { error } = await sb.from("clients").insert({
-        nom, adresse: $("#c-adr").value.trim() || null, contact: $("#c-contact").value.trim() || null,
-      });
-      if (error) return toast(error.message, "err");
-      toast("Client ajouté ✔", "ok"); render();
+      const payload = {
+        nom,
+        type_client: $("#c-type").value,
+        adresse: $("#c-adr").value.trim() || null,
+        contact: $("#c-contact").value.trim() || null,
+        email: $("#c-email").value.trim() || null,
+        telephone: $("#c-tel").value.trim() || null,
+        sextan_id: $("#c-sextan").value.trim() || null,
+      };
+      $("#save").disabled = true;
+      if (isNew) {
+        const { data, error } = await sb.from("clients").insert(payload).select().single();
+        if (error) { $("#save").disabled = false; return toast(error.message, "err"); }
+        go("client/" + data.id);
+      } else {
+        const { error } = await sb.from("clients").update(payload).eq("id", id);
+        $("#save").disabled = false;
+        toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
+        if (!error) go("client/" + id);
+      }
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Paramètres
+  // =========================================================================
+  async function viewParametres() {
+    const compta = await db.param("email_compta");
+    app.innerHTML =
+      topbar("Paramètres", { back: "compte" }) +
+      `<main>
+        <div class="card">
+          <label>Email du service comptabilité</label>
+          <input id="p-compta" type="email" value="${esc(compta)}" placeholder="compta@briffe.me" />
+          <div class="sub" style="margin-top:6px">Destinataire des manquants à facturer pour les clients ponctuels.</div>
+          <button class="btn block" id="p-save">Enregistrer</button>
+        </div>
+      </main>`;
+    $("#p-save").onclick = async () => {
+      const { error } = await db.setParam("email_compta", $("#p-compta").value.trim());
+      toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
     };
   }
 
@@ -717,8 +937,9 @@
           <h3>${esc(state.profile?.nom || state.user.email)}</h3>
           <div class="sub">${esc(state.user.email)} · ${esc(state.profile?.role || "livreur")}</div>
         </div>
+        <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.0</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.1</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }

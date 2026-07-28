@@ -114,7 +114,18 @@ Chaque exemplaire d'un type porte **la même étiquette**. Deux méthodes :
 > Le QR encode juste le **code texte** (ex. `GL-ARAVEN20`). L'image n'est jamais
 > stockée : elle est régénérée depuis le code, donc une réimpression est toujours
 > strictement identique à l'originale.
-2. **Clients** → ajoute tes clients (ou garde ceux d'exemple).
+2. **Clients** → ajoute tes clients (ou garde ceux d'exemple). Chaque client a un
+   **type** :
+   - **Ponctuel** : tout doit revenir au débarrassage. Sur l'écran *Manquants*
+     d'une prestation, le bouton **Envoyer les manquants à la compta** ouvre un
+     mail prérempli vers l'adresse compta (à régler dans **Paramètres**).
+   - **Fixe** : le client garde du matériel d'une fois sur l'autre. Sa **fiche**
+     affiche le **matériel détenu à l'instant T** (tout ce qui est sorti moins ce
+     qui est revenu, toutes prestations confondues), avec la valeur totale.
+     Boutons : **Envoyer le récap au client** (mail prérempli vers son email) et
+     **Facturer ce matériel** (perte/casse) → crée les lignes à facturer.
+   - Renseigne l'**email** du client (nécessaire pour lui envoyer un récap) et,
+     dans **Compte → Paramètres**, l'**email du service compta**.
 3. **Prestations** → crée une prestation (client + date).
 4. Le jour J, sur le téléphone :
    - **Sortie** : scanne les caisses + saisis les quantités livrées → *Valider*.
@@ -152,6 +163,13 @@ greenloop/
   hors-ligne peut être ajoutée en v2 si les zones de livraison sont mal couvertes.
 - **Facturation** : GreenLoop calcule et liste les montants à facturer. Le lien
   automatique vers la facturation Briffe pourra être branché ensuite.
+- **Emails (récap / manquants)** : pour l'instant les boutons ✉️ ouvrent ton
+  application mail avec le message prérempli (destinataire, objet, corps) — tu
+  n'as qu'à cliquer « Envoyer ». C'est immédiat et sans configuration. On pourra
+  passer à un **envoi automatique** (sans ouvrir le client mail) via une petite
+  fonction serveur Supabase + un service d'emailing, si tu le souhaites.
+- **Import Sextan des clients** : à brancher — voir avec toi le meilleur canal
+  (export CSV depuis Sextan, ou synchro via l'API Sextan côté serveur).
 - **Modèle QR par type** : un même QR pour tous les exemplaires d'un type ; on
   scanne chaque caisse à la sortie (chaque scan = +1) puis au retour, et le
   manquant = sortie − retour. Les types sans QR se comptent à la main.

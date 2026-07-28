@@ -47,14 +47,17 @@ create trigger on_auth_user_created
 -- 2. Clients
 -- ---------------------------------------------------------------------------
 create table if not exists public.clients (
-  id          uuid primary key default gen_random_uuid(),
-  nom         text not null,
-  adresse     text,
-  contact     text,
-  telephone   text,
-  email       text,
-  actif       boolean not null default true,
-  created_at  timestamptz not null default now()
+  id           uuid primary key default gen_random_uuid(),
+  nom          text not null,
+  type_client  text not null default 'ponctuel'   -- 'fixe' (garde du matériel) | 'ponctuel'
+               check (type_client in ('fixe','ponctuel')),
+  adresse      text,
+  contact      text,
+  telephone    text,
+  email        text,
+  sextan_id    text,                                -- identifiant du client dans Sextan (import)
+  actif        boolean not null default true,
+  created_at   timestamptz not null default now()
 );
 
 -- ---------------------------------------------------------------------------
@@ -134,7 +137,8 @@ create index if not exists idx_mvt_type on public.mouvements(type_id);
 -- ---------------------------------------------------------------------------
 create table if not exists public.facturations (
   id            uuid primary key default gen_random_uuid(),
-  prestation_id uuid not null references public.prestations(id) on delete cascade,
+  prestation_id uuid references public.prestations(id) on delete cascade,  -- rempli pour un ponctuel
+  client_id     uuid references public.clients(id) on delete set null,      -- rempli pour un fixe
   type_id       uuid not null references public.materiel_types(id) on delete restrict,
   unit_id       uuid references public.materiel_units(id) on delete set null,
   motif         text not null default 'perte'   -- 'perte' | 'casse' | 'autre'
@@ -148,6 +152,16 @@ create table if not exists public.facturations (
   created_at    timestamptz not null default now()
 );
 create index if not exists idx_fact_presta on public.facturations(prestation_id);
+create index if not exists idx_fact_client on public.facturations(client_id);
+
+-- ---------------------------------------------------------------------------
+-- 8. Paramètres généraux (clé/valeur) — ex : email du service compta
+-- ---------------------------------------------------------------------------
+create table if not exists public.parametres (
+  cle    text primary key,
+  valeur text
+);
+insert into public.parametres (cle, valeur) values ('email_compta', '') on conflict do nothing;
 
 -- ============================================================================
 --  VUE : bilan des manquants par prestation
@@ -180,6 +194,29 @@ left join retours r
   on r.prestation_id = s.prestation_id and r.type_id = s.type_id;
 
 -- ============================================================================
+--  VUE : solde de matériel détenu par client (à l'instant T)
+--  Somme de tous les mouvements (sortie − retour) du client, toutes prestas.
+--  Utile surtout pour les clients FIXES qui gardent du matériel.
+-- ============================================================================
+create or replace view public.v_solde_client as
+select p.client_id,
+       m.type_id,
+       t.nom          as type_nom,
+       t.categorie,
+       t.prix_unitaire,
+       sum(case when m.sens = 'sortie' then m.quantite else -m.quantite end) as solde
+from public.mouvements m
+join public.prestations p on p.id = m.prestation_id
+join public.materiel_types t on t.id = m.type_id
+where p.client_id is not null
+group by p.client_id, m.type_id, t.nom, t.categorie, t.prix_unitaire
+having sum(case when m.sens = 'sortie' then m.quantite else -m.quantite end) <> 0;
+
+-- Les vues respectent la RLS de l'appelant (et non du créateur)
+alter view public.v_bilan_manquants set (security_invoker = on);
+alter view public.v_solde_client    set (security_invoker = on);
+
+-- ============================================================================
 --  RLS : tout utilisateur authentifié peut lire/écrire.
 --  (MVP simple ; on affinera livreur vs admin plus tard.)
 -- ============================================================================
@@ -190,13 +227,14 @@ alter table public.materiel_units  enable row level security;
 alter table public.prestations     enable row level security;
 alter table public.mouvements      enable row level security;
 alter table public.facturations    enable row level security;
+alter table public.parametres      enable row level security;
 
 do $$
 declare t text;
 begin
   foreach t in array array[
     'profiles','clients','materiel_types','materiel_units',
-    'prestations','mouvements','facturations'
+    'prestations','mouvements','facturations','parametres'
   ]
   loop
     execute format('drop policy if exists "auth_read_%1$s"  on public.%1$s;', t);
@@ -222,9 +260,9 @@ insert into public.materiel_types (nom, categorie, code_qr, unite, prix_unitaire
   ('Plat de service',       'Vaisselle',      'GL-PLATSERVICE',    'pièce',   12.00)
 on conflict do nothing;
 
-insert into public.clients (nom, adresse, contact) values
-  ('Mairie de Lille',        '1 Place Augustin Laurent, Lille', 'Service événementiel'),
-  ('EDHEC Business School',  '24 Av. Gustave Delory, Roubaix',  'Accueil')
+insert into public.clients (nom, type_client, adresse, contact) values
+  ('Mairie de Lille',        'fixe',     '1 Place Augustin Laurent, Lille', 'Service événementiel'),
+  ('EDHEC Business School',  'ponctuel', '24 Av. Gustave Delory, Roubaix',  'Accueil')
 on conflict do nothing;
 
 -- Note : la table materiel_units existe pour compatibilité mais n'est plus
