@@ -733,20 +733,48 @@ Total : ${eur(total)}`;
   // =========================================================================
   async function viewClients() {
     const clients = await db.clients();
-    const cards = clients.length
-      ? clients.map((c) => `
-        <div class="card tap" onclick="location.hash='#/client/${c.id}'">
-          <div class="grow">
-            <div class="row between"><h3 class="truncate">${esc(c.nom)}</h3>${clientBadge(c.type_client)}</div>
-            <div class="sub">${esc(c.adresse || "")}${c.contact ? " · " + esc(c.contact) : ""}</div>
-          </div>
-          <div style="font-size:22px;color:#cbd5c9">›</div>
-        </div>`).join("")
-      : '<div class="empty"><div class="big">🏢</div>Aucun client.</div>';
+    const nFixe = clients.filter((c) => c.type_client === "fixe").length;
+    const nPonc = clients.filter((c) => c.type_client === "ponctuel").length;
+    const card = (c) => `
+      <div class="card tap" onclick="location.hash='#/client/${c.id}'">
+        <div class="grow">
+          <div class="row between"><h3 class="truncate">${esc(c.nom)}</h3>${clientBadge(c.type_client)}</div>
+          <div class="sub">${esc(c.adresse_livraison || c.adresse || "")}${c.contact ? " · " + esc(c.contact) : ""}</div>
+        </div>
+        <div style="font-size:22px;color:#cbd5c9">›</div>
+      </div>`;
+
     app.innerHTML =
       topbar("Clients") +
-      `<main>${cards}</main>
-       <button class="fab" onclick="location.hash='#/client/new'">＋</button>`;
+      `<main>
+        <div class="seg" id="filter">
+          <button data-f="tous" class="active">Tous (${clients.length})</button>
+          <button data-f="fixe">Fixes (${nFixe})</button>
+          <button data-f="ponctuel">Ponctuels (${nPonc})</button>
+        </div>
+        <input id="search" placeholder="🔍 Rechercher un client…" style="margin-bottom:10px" />
+        <div id="clist"></div>
+      </main>
+      <button class="fab" onclick="location.hash='#/client/new'">＋</button>`;
+
+    let f = "tous", q = "";
+    const draw = () => {
+      let list = clients;
+      if (f !== "tous") list = list.filter((c) => c.type_client === f);
+      if (q) list = list.filter((c) => (c.nom || "").toLowerCase().includes(q));
+      $("#clist").innerHTML = list.length
+        ? list.map(card).join("")
+        : '<div class="empty"><div class="big">🏢</div>Aucun client.</div>';
+    };
+    $("#filter").addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      f = b.dataset.f;
+      $$("#filter button").forEach((x) => x.classList.toggle("active", x === b));
+      draw();
+    });
+    $("#search").addEventListener("input", (e) => { q = e.target.value.trim().toLowerCase(); draw(); });
+    draw();
   }
 
   // =========================================================================
@@ -765,7 +793,8 @@ Total : ${eur(total)}`;
         <div class="card">
           <div class="row between">
             <div class="grow">
-              <div class="sub">${esc(c.adresse || "")}</div>
+              ${c.adresse ? `<div class="sub">📍 ${esc(c.adresse)}</div>` : ""}
+              ${c.adresse_livraison ? `<div class="sub">🚚 Livraison : ${esc(c.adresse_livraison)}</div>` : ""}
               <div class="sub">${c.contact ? esc(c.contact) : ""}${c.email ? " · " + esc(c.email) : ""}${c.telephone ? " · " + esc(c.telephone) : ""}</div>
             </div>
             ${clientBadge(c.type_client)}
@@ -792,9 +821,40 @@ Total : ${eur(total)}`;
 
         <div class="section-title">Prestations</div>
         <div class="card" id="prestas"><div class="sub">Chargement…</div></div>
+
+        <div class="btn-grid" style="margin-top:16px">
+          <button class="btn sec" id="edit">✏️ Modifier</button>
+          <button class="btn ghost" id="del" style="color:var(--danger)">🗑 Supprimer</button>
+        </div>
       </main>`;
 
     $("#tb-action").onclick = () => go("client/" + id + "/edit");
+    $("#edit").onclick = () => go("client/" + id + "/edit");
+
+    // suppression en deux temps (pas de pop-up bloquant)
+    let armed = false;
+    const delBtn = $("#del");
+    delBtn.onclick = async () => {
+      if (!armed) {
+        armed = true;
+        delBtn.textContent = "Confirmer la suppression ?";
+        delBtn.classList.remove("ghost");
+        delBtn.classList.add("danger");
+        setTimeout(() => {
+          if (!armed) return;
+          armed = false;
+          delBtn.textContent = "🗑 Supprimer";
+          delBtn.classList.add("ghost");
+          delBtn.classList.remove("danger");
+        }, 4000);
+        return;
+      }
+      delBtn.disabled = true;
+      const { error } = await sb.from("clients").delete().eq("id", id);
+      if (error) { delBtn.disabled = false; return toast(error.message, "err"); }
+      toast("Client supprimé ✔", "ok");
+      go("clients");
+    };
 
     // liste des prestations du client
     const prestas = await db.prestationsByClient(id);
@@ -869,7 +929,8 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} à facturer.`;
             <option value="ponctuel" ${c.type_client === "ponctuel" ? "selected" : ""}>Ponctuel (tout revient au débarrassage)</option>
             <option value="fixe" ${c.type_client === "fixe" ? "selected" : ""}>Fixe (garde du matériel d'une fois sur l'autre)</option>
           </select>
-          <label>Adresse</label><input id="c-adr" value="${esc(c.adresse || "")}" placeholder="Adresse de livraison" />
+          <label>Adresse (siège / facturation)</label><input id="c-adr" value="${esc(c.adresse || "")}" placeholder="Adresse principale" />
+          <label>Adresse de livraison</label><input id="c-adrliv" value="${esc(c.adresse_livraison || "")}" placeholder="Si différente de l'adresse principale" />
           <label>Contact</label><input id="c-contact" value="${esc(c.contact || "")}" placeholder="Personne / service" />
           <div class="field-row">
             <div><label>Email</label><input id="c-email" type="email" value="${esc(c.email || "")}" placeholder="pour le récap" /></div>
@@ -886,6 +947,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} à facturer.`;
         nom,
         type_client: $("#c-type").value,
         adresse: $("#c-adr").value.trim() || null,
+        adresse_livraison: $("#c-adrliv").value.trim() || null,
         contact: $("#c-contact").value.trim() || null,
         email: $("#c-email").value.trim() || null,
         telephone: $("#c-tel").value.trim() || null,

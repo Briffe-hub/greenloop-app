@@ -51,7 +51,8 @@ create table if not exists public.clients (
   nom          text not null,
   type_client  text not null default 'ponctuel'   -- 'fixe' (garde du matériel) | 'ponctuel'
                check (type_client in ('fixe','ponctuel')),
-  adresse      text,
+  adresse           text,                           -- siège / facturation
+  adresse_livraison text,                            -- si différente
   contact      text,
   telephone    text,
   email        text,
