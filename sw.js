@@ -1,7 +1,7 @@
 /* GreenLoop — Service Worker
    Cache "app shell" pour l'installation PWA et un chargement rapide.
    Les données (Supabase) ne sont pas mises en cache : toujours en réseau. */
-const CACHE = "greenloop-v1";
+const CACHE = "greenloop-v2";
 const SHELL = [
   "./",
   "./index.html",
@@ -28,11 +28,19 @@ self.addEventListener("activate", (e) => {
   );
 });
 
+// Stratégie « réseau d'abord » : on récupère toujours la dernière version en
+// ligne (les mises à jour arrivent immédiatement), et on retombe sur le cache
+// uniquement hors-ligne. Les appels externes (Supabase) ne sont pas interceptés.
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
-  // Ne jamais mettre en cache les appels réseau (Supabase, CDN dynamiques)
   if (url.origin !== location.origin) return;
   e.respondWith(
-    caches.match(e.request).then((hit) => hit || fetch(e.request))
+    fetch(e.request)
+      .then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
+        return res;
+      })
+      .catch(() => caches.match(e.request))
   );
 });
