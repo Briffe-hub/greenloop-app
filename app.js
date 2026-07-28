@@ -735,11 +735,13 @@ Total : ${eur(total)}`;
     const clients = await db.clients();
     const nFixe = clients.filter((c) => c.type_client === "fixe").length;
     const nPonc = clients.filter((c) => c.type_client === "ponctuel").length;
+    const cats = [...new Set(clients.map((c) => c.categorie).filter(Boolean))].sort();
     const card = (c) => `
       <div class="card tap" onclick="location.hash='#/client/${c.id}'">
         <div class="grow">
           <div class="row between"><h3 class="truncate">${esc(c.nom)}</h3>${clientBadge(c.type_client)}</div>
           <div class="sub">${esc(c.adresse_livraison || c.adresse || "")}${c.contact ? " · " + esc(c.contact) : ""}</div>
+          ${c.categorie ? `<div class="sub">🏷️ ${esc(c.categorie)}${c.groupe ? " · " + esc(c.groupe) : ""}</div>` : ""}
         </div>
         <div style="font-size:22px;color:#cbd5c9">›</div>
       </div>`;
@@ -752,18 +754,33 @@ Total : ${eur(total)}`;
           <button data-f="fixe">Fixes (${nFixe})</button>
           <button data-f="ponctuel">Ponctuels (${nPonc})</button>
         </div>
-        <input id="search" placeholder="🔍 Rechercher un client…" style="margin-bottom:10px" />
+        ${cats.length ? `<select id="catfilter" style="margin-bottom:10px">
+          <option value="">Toutes les catégories</option>
+          ${cats.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+        </select>` : ""}
+        <input id="search" placeholder="🔍 Rechercher (nom, catégorie, groupe…)" style="margin-bottom:10px" />
         <div id="clist"></div>
       </main>
       <button class="fab" onclick="location.hash='#/client/new'">＋</button>`;
 
-    let f = "tous", q = "";
+    let f = "tous", q = "", cat = "";
     const draw = () => {
       let list = clients;
       if (f !== "tous") list = list.filter((c) => c.type_client === f);
-      if (q) list = list.filter((c) => (c.nom || "").toLowerCase().includes(q));
-      $("#clist").innerHTML = list.length
-        ? list.map(card).join("")
+      if (cat) list = list.filter((c) => c.categorie === cat);
+      if (q) list = list.filter((c) =>
+        [c.nom, c.categorie, c.groupe, c.contact].some((v) => (v || "").toLowerCase().includes(q)));
+      // regroupe par "groupe" quand une catégorie est sélectionnée
+      let html;
+      if (cat) {
+        const byG = {};
+        list.forEach((c) => ((byG[c.groupe || "—"] ||= []).push(c)));
+        html = Object.keys(byG).sort().map((g) =>
+          `<div class="section-title">${esc(g)}</div>${byG[g].map(card).join("")}`).join("");
+      } else {
+        html = list.map(card).join("");
+      }
+      $("#clist").innerHTML = list.length ? html
         : '<div class="empty"><div class="big">🏢</div>Aucun client.</div>';
     };
     $("#filter").addEventListener("click", (e) => {
@@ -773,6 +790,8 @@ Total : ${eur(total)}`;
       $$("#filter button").forEach((x) => x.classList.toggle("active", x === b));
       draw();
     });
+    const cf = $("#catfilter");
+    if (cf) cf.addEventListener("change", (e) => { cat = e.target.value; draw(); });
     $("#search").addEventListener("input", (e) => { q = e.target.value.trim().toLowerCase(); draw(); });
     draw();
   }
@@ -793,6 +812,7 @@ Total : ${eur(total)}`;
         <div class="card">
           <div class="row between">
             <div class="grow">
+              ${c.categorie ? `<div class="sub">🏷️ ${esc(c.categorie)}${c.groupe ? " · " + esc(c.groupe) : ""}</div>` : ""}
               ${c.adresse ? `<div class="sub">📍 ${esc(c.adresse)}</div>` : ""}
               ${c.adresse_livraison ? `<div class="sub">🚚 Livraison : ${esc(c.adresse_livraison)}</div>` : ""}
               <div class="sub">${c.contact ? esc(c.contact) : ""}${c.email ? " · " + esc(c.email) : ""}${c.telephone ? " · " + esc(c.telephone) : ""}</div>
@@ -936,10 +956,23 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} à facturer.`;
             <div><label>Email</label><input id="c-email" type="email" value="${esc(c.email || "")}" placeholder="pour le récap" /></div>
             <div><label>Téléphone</label><input id="c-tel" value="${esc(c.telephone || "")}" /></div>
           </div>
+          <div class="field-row">
+            <div><label>Catégorie</label><input id="c-cat" list="cat-list" value="${esc(c.categorie || "")}" placeholder="ex. Appels d'offre" /></div>
+            <div><label>Groupe</label><input id="c-groupe" value="${esc(c.groupe || "")}" placeholder="ex. UnivLille" /></div>
+          </div>
+          <datalist id="cat-list"></datalist>
           <label>ID Sextan (optionnel)</label><input id="c-sextan" value="${esc(c.sextan_id || "")}" />
           <button class="btn block" id="save">${isNew ? "Créer" : "Enregistrer"}</button>
         </div>
       </main>`;
+
+    // suggestions de catégories déjà utilisées
+    db.clients().then((all) => {
+      const cats = [...new Set(all.map((x) => x.categorie).filter(Boolean))].sort();
+      const dl = $("#cat-list");
+      if (dl) dl.innerHTML = cats.map((c) => `<option value="${esc(c)}"></option>`).join("");
+    }).catch(() => {});
+
     $("#save").onclick = async () => {
       const nom = $("#c-nom").value.trim();
       if (!nom) return toast("Ajoute un nom", "err");
@@ -951,6 +984,8 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} à facturer.`;
         contact: $("#c-contact").value.trim() || null,
         email: $("#c-email").value.trim() || null,
         telephone: $("#c-tel").value.trim() || null,
+        categorie: $("#c-cat").value.trim() || null,
+        groupe: $("#c-groupe").value.trim() || null,
         sextan_id: $("#c-sextan").value.trim() || null,
       };
       $("#save").disabled = true;

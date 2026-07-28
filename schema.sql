@@ -53,6 +53,8 @@ create table if not exists public.clients (
                check (type_client in ('fixe','ponctuel')),
   adresse           text,                           -- siège / facturation
   adresse_livraison text,                            -- si différente
+  categorie         text,                            -- ex. "Appels d'offre"
+  groupe            text,                            -- ex. "UnivLille", "Euratech"
   contact      text,
   telephone    text,
   email        text,
