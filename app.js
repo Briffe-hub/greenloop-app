@@ -124,6 +124,7 @@
         const sub = parts[2];
         if (sub === "sortie") return viewFlux(id, "sortie");
         if (sub === "retour") return viewFlux(id, "retour");
+        if (sub === "recuperation") return viewRecuperation(id);
         if (sub === "manquants") return viewManquants(id);
         return viewPrestationDetail(id);
       }
@@ -167,10 +168,18 @@
       : "";
     return `<div class="topbar">${back}<h1>${esc(title)}</h1>${act}</div>`;
   }
-  const prestaBadge = (s) =>
-    ({ en_cours: '<span class="badge amber">En cours</span>',
-       livre: '<span class="badge blue">Livré</span>',
-       clos: '<span class="badge green">Clos</span>' }[s] || "");
+  const STATUT_LABEL = {
+    en_cours: "En préparation",
+    en_livraison: "En cours de livraison",
+    a_recuperer: "Livré – à récupérer",
+    recupere: "Récupéré",
+    livre: "Livré",
+    clos: "Clos",
+  };
+  const prestaBadge = (s) => {
+    const cls = { en_cours: "gray", en_livraison: "blue", a_recuperer: "amber", recupere: "green", livre: "green", clos: "gray" }[s] || "gray";
+    return `<span class="badge ${cls}">${esc(STATUT_LABEL[s] || s)}</span>`;
+  };
 
   // =========================================================================
   //  VUE : Liste des prestations
@@ -220,8 +229,8 @@
             ${clients.map((c) => `<option value="${c.id}">${esc(c.nom)}</option>`).join("")}
           </select>
           <div class="field-row">
-            <div><label>Date</label><input id="f-date" type="date" value="${new Date().toISOString().slice(0,10)}" /></div>
-            <div><label>Référence</label><input id="f-ref" placeholder="N° dossier" /></div>
+            <div><label>Date de livraison</label><input id="f-date" type="date" value="${new Date().toISOString().slice(0,10)}" /></div>
+            <div><label>Numéro</label><input id="f-ref" placeholder="N° dossier" /></div>
           </div>
           <label>Notes</label>
           <textarea id="f-notes" placeholder="Infos utiles pour le livreur…"></textarea>
@@ -276,29 +285,50 @@
         <div class="stat">
           <div class="box"><div class="n">${totalSortie}</div><div class="l">Sortis</div></div>
           <div class="box"><div class="n green">${totalRetour}</div><div class="l">Revenus</div></div>
-          <div class="box"><div class="n ${totalManq ? "red" : "green"}">${totalManq}</div><div class="l">Manquants</div></div>
         </div>
 
-        <div class="btn-grid" style="margin-top:14px">
-          <button class="btn" onclick="location.hash='#/prestation/${id}/sortie'">📤 Sortie<br><small style="font-weight:500">Livré chez le client</small></button>
-          <button class="btn sec" onclick="location.hash='#/prestation/${id}/retour'">📥 Retour<br><small style="font-weight:500">Matériel récupéré</small></button>
-        </div>
-        <button class="btn ghost block" onclick="location.hash='#/prestation/${id}/manquants'">📊 Rapport des manquants${totalManq ? ` (${totalManq})` : ""}</button>
-
-        <div class="section-title">Statut de la prestation</div>
-        <div class="card">
-          <select id="statut">
-            <option value="en_cours" ${p.statut==="en_cours"?"selected":""}>En cours</option>
-            <option value="livre" ${p.statut==="livre"?"selected":""}>Livré</option>
-            <option value="clos" ${p.statut==="clos"?"selected":""}>Clos</option>
-          </select>
-        </div>
+        <div class="section-title">Étape en cours</div>
+        <div id="workflow"></div>
       </main>`;
 
-    $("#statut").onchange = async (e) => {
-      const { error } = await sb.from("prestations").update({ statut: e.target.value }).eq("id", id);
-      toast(error ? error.message : "Statut mis à jour", error ? "err" : "ok");
-    };
+    // ---- Workflow guidé selon le statut et le type de client ----
+    const fixe = p.clients && p.clients.type_client === "fixe";
+    const wf = $("#workflow");
+    const bigBtn = (label, sub, cls, onclick) =>
+      `<button class="btn ${cls} block" style="padding:18px" onclick="${onclick}">${label}<br><small style="font-weight:500">${sub}</small></button>`;
+
+    if (p.statut === "en_cours") {
+      wf.innerHTML = bigBtn("📤 Valider la sortie (quai)", "Enregistre le matériel chargé au départ", "",
+        `location.hash='#/prestation/${id}/sortie'`);
+    } else if (p.statut === "en_livraison") {
+      if (fixe) {
+        wf.innerHTML = bigBtn("✅ Valider livraison + récupération", "Ce qui est repris est enregistré en même temps", "",
+          `location.hash='#/prestation/${id}/retour'`);
+      } else {
+        wf.innerHTML =
+          `<div class="card"><div class="sub">Matériel chargé, en route vers le client.</div></div>` +
+          `<button class="btn block" id="wf-livre" style="padding:18px">✅ Confirmer la livraison<br><small style="font-weight:500">Le matériel est déposé chez le client</small></button>`;
+        $("#wf-livre").onclick = async () => {
+          const { error } = await sb.from("prestations").update({ statut: "a_recuperer" }).eq("id", id);
+          if (error) return toast(error.message, "err");
+          toast("Livraison confirmée ✔", "ok"); render();
+        };
+      }
+    } else if (p.statut === "a_recuperer") {
+      wf.innerHTML = bigBtn("📥 Récupérer le matériel", "Pointe le matériel repris chez le client", "",
+        `location.hash='#/prestation/${id}/recuperation'`);
+    } else if (p.statut === "recupere" || p.statut === "livre") {
+      wf.innerHTML =
+        `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div><b>Prestation ${STATUT_LABEL[p.statut].toLowerCase()}.</b>
+          ${totalManq ? `<div class="sub" style="margin-top:6px">${totalManq} pièce(s) non restituée(s) — voir la fiche client pour la facturation.</div>` : `<div class="sub" style="margin-top:6px">Tout est réglé.</div>`}</div>`;
+    }
+
+    // Accès discret pour corriger une étape si besoin (insertAdjacentHTML pour ne pas
+    // détruire les gestionnaires d'événements déjà attachés ci-dessus)
+    wf.insertAdjacentHTML("beforeend", `<div class="sub" style="text-align:center;margin-top:14px">
+      <a href="#/prestation/${id}/sortie" style="color:var(--muted)">Revoir la sortie</a>
+      ${!fixe ? ` · <a href="#/prestation/${id}/recuperation" style="color:var(--muted)">Récupération</a>` : ` · <a href="#/prestation/${id}/retour" style="color:var(--muted)">Récupération</a>`}
+    </div>`);
   }
 
   // =========================================================================
@@ -485,6 +515,9 @@
         const { error } = await sb.from("facturations").insert(facts);
         if (error) { $("#valider").disabled = false; return toast("Retour ok mais facturation : " + error.message, "err"); }
       }
+      // avancement du statut de la prestation
+      const nextStatut = sens === "sortie" ? "en_livraison" : "livre"; // retour = livraison+récup d'un client fixe
+      await sb.from("prestations").update({ statut: nextStatut }).eq("id", id);
       stopScanner();
       toast(facts.length ? `${label} + ${facts.length} à facturer ✔` : label + " enregistrée ✔", "ok");
       go("prestation/" + id);
@@ -532,6 +565,110 @@
       g.gain.setValueAtTime(0.15, ctx.currentTime);
       o.start(); o.stop(ctx.currentTime + 0.08);
     } catch (e) {}
+  }
+
+  // =========================================================================
+  //  VUE : Récupération (client ponctuel) — pointage de ce qui revient
+  // =========================================================================
+  async function viewRecuperation(id) {
+    const p = await db.prestation(id);
+    const bilan = await db.bilan(id);
+    const lignes = bilan.filter((b) => b.q_manquant > 0); // reste à récupérer
+
+    const line = (b) => `
+      <div class="card" data-rec="${b.type_id}" data-exp="${b.q_manquant}" data-prix="${b.prix_unitaire}" data-nom="${esc(b.type_nom)}">
+        <div class="row between"><b>${esc(b.type_nom)}</b><span class="badge gray">Attendu ${b.q_manquant}</span></div>
+        <div class="field-row" style="margin-top:8px">
+          <div><label style="margin-top:0">Récupéré</label><input class="rec-in" type="number" inputmode="numeric" value="${b.q_manquant}" min="0" max="${b.q_manquant}" /></div>
+          <div><label style="margin-top:0">Cassé</label><input class="casse-in" type="number" inputmode="numeric" value="0" min="0" max="${b.q_manquant}" /></div>
+        </div>
+        <div class="sub perte-lbl" style="margin-top:6px"></div>
+      </div>`;
+
+    app.innerHTML =
+      topbar("Récupération · " + (p.libelle || ""), { back: "prestation/" + id }) +
+      `<main>
+        ${lignes.length === 0
+          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Rien à récupérer sur cette prestation.</div>`
+          : `<div class="sub" style="margin-bottom:8px">Pointe chaque ligne : par défaut tout est récupéré. Ajuste « Récupéré » et « Cassé » si besoin ; le reste est compté comme perte.</div>
+             <button class="btn sec block" id="tout" style="margin-bottom:10px">✅ Tout récupéré, rien à signaler</button>
+             ${lignes.map(line).join("")}`}
+
+        <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
+          <div class="row between" style="margin-bottom:8px"><b id="recap-rec">À facturer : 0,00 €</b></div>
+          <button class="btn block" id="valider">Valider la récupération</button>
+        </div>
+      </main>`;
+
+    const cards = () => $$("[data-rec]");
+    const readCard = (el) => {
+      const exp = parseInt(el.dataset.exp);
+      let rec = Math.max(0, Math.min(exp, parseInt(el.querySelector(".rec-in").value) || 0));
+      let casse = Math.max(0, Math.min(exp - rec, parseInt(el.querySelector(".casse-in").value) || 0));
+      const perte = Math.max(0, exp - rec - casse);
+      return { tid: el.dataset.rec, nom: el.dataset.nom, prix: Number(el.dataset.prix), exp, rec, casse, perte };
+    };
+    const refresh = () => {
+      let total = 0;
+      cards().forEach((el) => {
+        const d = readCard(el);
+        total += (d.casse + d.perte) * d.prix;
+        const lbl = el.querySelector(".perte-lbl");
+        if (d.casse + d.perte === 0) { lbl.innerHTML = "✔ complet"; lbl.style.color = "var(--ok)"; }
+        else { lbl.innerHTML = `${d.casse ? d.casse + " cassé(s) · " : ""}${d.perte ? d.perte + " perdu(s)" : ""} → ${eur((d.casse + d.perte) * d.prix)}`; lbl.style.color = "var(--danger)"; }
+      });
+      const r = $("#recap-rec"); if (r) r.textContent = "À facturer : " + eur(total);
+    };
+    app.querySelector("main").addEventListener("input", (e) => { if (e.target.closest("[data-rec]")) refresh(); });
+    const tout = $("#tout");
+    if (tout) tout.onclick = () => {
+      cards().forEach((el) => { el.querySelector(".rec-in").value = el.dataset.exp; el.querySelector(".casse-in").value = 0; });
+      refresh();
+    };
+    refresh();
+
+    $("#valider").onclick = async () => {
+      const mvts = [], facts = [], manquantsTxt = [];
+      cards().forEach((el) => {
+        const d = readCard(el);
+        // tout l'attendu est soldé (récupéré, cassé ou perdu)
+        mvts.push({ prestation_id: id, sens: "retour", type_id: d.tid, unit_id: null, quantite: d.exp, par_user: state.user.id });
+        if (d.casse > 0) { facts.push({ prestation_id: id, client_id: p.client_id || null, type_id: d.tid, motif: "casse", quantite: d.casse, prix_unitaire: d.prix, statut: "a_facturer" }); }
+        if (d.perte > 0) { facts.push({ prestation_id: id, client_id: p.client_id || null, type_id: d.tid, motif: "perte", quantite: d.perte, prix_unitaire: d.prix, statut: "a_facturer" }); }
+        if (d.casse + d.perte > 0) manquantsTxt.push(`- ${d.nom} : ${d.casse ? d.casse + " cassé(s)" : ""}${d.casse && d.perte ? ", " : ""}${d.perte ? d.perte + " perdu(s)" : ""} (${eur((d.casse + d.perte) * d.prix)})`);
+      });
+      $("#valider").disabled = true;
+      if (mvts.length) {
+        const { error } = await sb.from("mouvements").insert(mvts);
+        if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
+      }
+      if (facts.length) {
+        const { error } = await sb.from("facturations").insert(facts);
+        if (error) { $("#valider").disabled = false; return toast("Récup ok mais facturation : " + error.message, "err"); }
+      }
+      await sb.from("prestations").update({ statut: "recupere" }).eq("id", id);
+
+      // Email au service compta si des manquants
+      if (manquantsTxt.length) {
+        const compta = await db.param("email_compta");
+        const cli = p.clients ? p.clients.nom : "Client ?";
+        const total = facts.reduce((s, f) => s + f.quantite * f.prix_unitaire, 0);
+        const body =
+`Prestation : ${p.libelle || ""}
+Client : ${cli}
+Date : ${dfr(p.date_presta)}
+
+Matériel non récupéré / cassé à facturer :
+${manquantsTxt.join("\n")}
+
+Total : ${eur(total)}`;
+        if (compta) openMail(compta, `Matériel à facturer — ${cli} (${p.libelle || ""})`, body);
+        else toast("Récup enregistrée. Renseigne l'email compta dans Paramètres pour l'envoi auto.", "ok");
+      } else {
+        toast("Récupération complète ✔", "ok");
+      }
+      go("prestation/" + id);
+    };
   }
 
   // =========================================================================
@@ -939,9 +1076,10 @@ Total : ${eur(total)}`;
     // liste des prestations du client
     const prestas = await db.prestationsByClient(id);
     $("#prestas").innerHTML = prestas.length
-      ? prestas.map((p) => `<div class="mat-line" onclick="location.hash='#/prestation/${p.id}'" style="cursor:pointer">
-          <div class="name"><b>${esc(p.libelle || "Prestation")}</b><small>${dfr(p.date_presta)}</small></div>
-          <div style="color:#cbd5c9">›</div></div>`).join("")
+      ? prestas.map((p) => `<div class="mat-line">
+          <div class="name" onclick="location.hash='#/prestation/${p.id}'" style="cursor:pointer;flex:1"><b>${esc(p.libelle || "Prestation")}</b><small>${dfr(p.date_presta)} · ${esc(STATUT_LABEL[p.statut] || "")}</small></div>
+          <button class="btn sm ghost" onclick="location.hash='#/prestation/${p.id}/manquants'" style="padding:6px 10px;flex:0 0 auto">📊 Manquants</button>
+        </div>`).join("")
       : '<div class="sub">Aucune prestation.</div>';
 
     // récap par email
