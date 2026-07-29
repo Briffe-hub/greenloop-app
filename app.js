@@ -611,7 +611,7 @@
         <div class="row between"><b>${esc(b.type_nom)}</b><span class="badge gray">Attendu ${b.q_manquant}</span></div>
         <div class="field-row" style="margin-top:8px">
           <div><label style="margin-top:0">Récupéré</label><input class="rec-in" type="number" inputmode="numeric" value="${b.q_manquant}" min="0" max="${b.q_manquant}" /></div>
-          <div><label style="margin-top:0">Cassé</label><input class="casse-in" type="number" inputmode="numeric" value="0" min="0" max="${b.q_manquant}" /></div>
+          <div><label style="margin-top:0">Non récupéré</label><input class="nonrec-in" type="number" inputmode="numeric" value="0" min="0" max="${b.q_manquant}" /></div>
         </div>
         <div class="sub perte-lbl" style="margin-top:6px"></div>
       </div>`;
@@ -621,7 +621,7 @@
       `<main>
         ${lignes.length === 0
           ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Rien à récupérer sur cette prestation.</div>`
-          : `<div class="sub" style="margin-bottom:8px">Pointe chaque ligne : par défaut tout est récupéré. Ajuste « Récupéré » et « Cassé » si besoin ; le reste est compté comme perte.</div>
+          : `<div class="sub" style="margin-bottom:8px">Pointe chaque ligne : par défaut tout est récupéré. Indique le nombre « Non récupéré » le cas échéant — il sera facturé au client.</div>
              <button class="btn sec block" id="tout" style="margin-bottom:10px">✅ Tout récupéré, rien à signaler</button>
              ${lignes.map(line).join("")}`}
 
@@ -634,26 +634,39 @@
     const cards = () => $$("[data-rec]");
     const readCard = (el) => {
       const exp = parseInt(el.dataset.exp);
-      let rec = Math.max(0, Math.min(exp, parseInt(el.querySelector(".rec-in").value) || 0));
-      let casse = Math.max(0, Math.min(exp - rec, parseInt(el.querySelector(".casse-in").value) || 0));
-      const perte = Math.max(0, exp - rec - casse);
-      return { tid: el.dataset.rec, nom: el.dataset.nom, prix: Number(el.dataset.prix), exp, rec, casse, perte };
+      const nonrec = Math.max(0, Math.min(exp, parseInt(el.querySelector(".nonrec-in").value) || 0));
+      const rec = exp - nonrec;
+      return { tid: el.dataset.rec, nom: el.dataset.nom, prix: Number(el.dataset.prix), exp, rec, nonrec };
     };
     const refresh = () => {
       let total = 0;
       cards().forEach((el) => {
         const d = readCard(el);
-        total += (d.casse + d.perte) * d.prix;
+        total += d.nonrec * d.prix;
         const lbl = el.querySelector(".perte-lbl");
-        if (d.casse + d.perte === 0) { lbl.innerHTML = "✔ complet"; lbl.style.color = "var(--ok)"; }
-        else { lbl.innerHTML = `${d.casse ? d.casse + " cassé(s) · " : ""}${d.perte ? d.perte + " perdu(s)" : ""} → ${eur((d.casse + d.perte) * d.prix)}`; lbl.style.color = "var(--danger)"; }
+        if (d.nonrec === 0) { lbl.innerHTML = "✔ complet"; lbl.style.color = "var(--ok)"; }
+        else { lbl.innerHTML = `${d.nonrec} non récupéré(s) → ${eur(d.nonrec * d.prix)}`; lbl.style.color = "var(--danger)"; }
       });
       const r = $("#recap-rec"); if (r) r.textContent = "À facturer : " + eur(total);
     };
-    app.querySelector("main").addEventListener("input", (e) => { if (e.target.closest("[data-rec]")) refresh(); });
+    // Récupéré et Non récupéré sont complémentaires : éditer l'un ajuste l'autre
+    app.querySelector("main").addEventListener("input", (e) => {
+      const el = e.target.closest("[data-rec]");
+      if (!el) return;
+      const exp = parseInt(el.dataset.exp);
+      const recIn = el.querySelector(".rec-in"), nonIn = el.querySelector(".nonrec-in");
+      if (e.target === recIn) {
+        const rec = Math.max(0, Math.min(exp, parseInt(recIn.value) || 0));
+        recIn.value = rec; nonIn.value = exp - rec;
+      } else if (e.target === nonIn) {
+        const non = Math.max(0, Math.min(exp, parseInt(nonIn.value) || 0));
+        nonIn.value = non; recIn.value = exp - non;
+      }
+      refresh();
+    });
     const tout = $("#tout");
     if (tout) tout.onclick = () => {
-      cards().forEach((el) => { el.querySelector(".rec-in").value = el.dataset.exp; el.querySelector(".casse-in").value = 0; });
+      cards().forEach((el) => { el.querySelector(".rec-in").value = el.dataset.exp; el.querySelector(".nonrec-in").value = 0; });
       refresh();
     };
     refresh();
@@ -662,11 +675,12 @@
       const mvts = [], facts = [], manquantsTxt = [];
       cards().forEach((el) => {
         const d = readCard(el);
-        // tout l'attendu est soldé (récupéré, cassé ou perdu)
+        // tout l'attendu est soldé (récupéré ou non récupéré / facturé)
         mvts.push({ prestation_id: id, sens: "retour", type_id: d.tid, unit_id: null, quantite: d.exp, par_user: state.user.id });
-        if (d.casse > 0) { facts.push({ prestation_id: id, client_id: p.client_id || null, type_id: d.tid, motif: "casse", quantite: d.casse, prix_unitaire: d.prix, statut: "a_facturer" }); }
-        if (d.perte > 0) { facts.push({ prestation_id: id, client_id: p.client_id || null, type_id: d.tid, motif: "perte", quantite: d.perte, prix_unitaire: d.prix, statut: "a_facturer" }); }
-        if (d.casse + d.perte > 0) manquantsTxt.push(`- ${d.nom} : ${d.casse ? d.casse + " cassé(s)" : ""}${d.casse && d.perte ? ", " : ""}${d.perte ? d.perte + " perdu(s)" : ""} (${eur((d.casse + d.perte) * d.prix)})`);
+        if (d.nonrec > 0) {
+          facts.push({ prestation_id: id, client_id: p.client_id || null, type_id: d.tid, motif: "perte", quantite: d.nonrec, prix_unitaire: d.prix, statut: "a_facturer" });
+          manquantsTxt.push(`- ${d.nom} : ${d.nonrec} non récupéré(s) (${eur(d.nonrec * d.prix)})`);
+        }
       });
       $("#valider").disabled = true;
       if (mvts.length) {
@@ -689,7 +703,7 @@
 Client : ${cli}
 Date : ${dfr(p.date_presta)}
 
-Matériel non récupéré / cassé à facturer :
+Matériel non récupéré à facturer :
 ${manquantsTxt.join("\n")}
 
 Total : ${eur(total)}`;
