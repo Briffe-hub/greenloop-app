@@ -186,30 +186,61 @@
   // =========================================================================
   async function viewPrestations() {
     const list = await db.prestations();
-    let cli = {};
-    (await db.clients()).forEach((c) => (cli[c.id] = c.nom));
-    const cards = list.length
-      ? list
-          .map(
-            (p) => `
-        <div class="card tap" onclick="location.hash='#/prestation/${p.id}'">
-          <div class="grow">
-            <div class="row between">
-              <h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>
-              ${prestaBadge(p.statut)}
-            </div>
-            <div class="sub">${esc(cli[p.client_id] || "Client ?")} · ${dfr(p.date_presta)}</div>
+    const cli = {};
+    (await db.clients()).forEach((c) => (cli[c.id] = c));
+
+    const isAO = (p) => (cli[p.client_id] && cli[p.client_id].categorie || "").toLowerCase().includes("appel");
+    const typeOf = (p) => cli[p.client_id] ? cli[p.client_id].type_client : null;
+    const counts = {
+      tout: list.length,
+      fixe: list.filter((p) => typeOf(p) === "fixe").length,
+      ponctuel: list.filter((p) => typeOf(p) === "ponctuel").length,
+      ao: list.filter(isAO).length,
+    };
+
+    const card = (p) => `
+      <div class="card tap" onclick="location.hash='#/prestation/${p.id}'">
+        <div class="grow">
+          <div class="row between">
+            <h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>
+            ${prestaBadge(p.statut)}
           </div>
-          <div style="font-size:22px;color:#cbd5c9">›</div>
-        </div>`
-          )
-          .join("")
-      : `<div class="empty"><div class="big">📋</div>Aucune prestation.<br>Crée-en une pour commencer.</div>`;
+          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}</div>
+        </div>
+        <div style="font-size:22px;color:#cbd5c9">›</div>
+      </div>`;
 
     app.innerHTML =
       topbar("Prestations") +
-      `<main>${cards}</main>
-       <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
+      `<main>
+        <div class="seg" id="pfilter">
+          <button data-f="tout" class="active">Tout (${counts.tout})</button>
+          <button data-f="fixe">Fixes (${counts.fixe})</button>
+          <button data-f="ponctuel">Ponctuels (${counts.ponctuel})</button>
+          <button data-f="ao">Appels d'offre (${counts.ao})</button>
+        </div>
+        <div id="plist"></div>
+      </main>
+      <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
+
+    let f = "tout";
+    const draw = () => {
+      let l = list;
+      if (f === "fixe") l = list.filter((p) => typeOf(p) === "fixe");
+      else if (f === "ponctuel") l = list.filter((p) => typeOf(p) === "ponctuel");
+      else if (f === "ao") l = list.filter(isAO);
+      $("#plist").innerHTML = l.length
+        ? l.map(card).join("")
+        : `<div class="empty"><div class="big">📋</div>Aucune prestation.</div>`;
+    };
+    $("#pfilter").addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      f = b.dataset.f;
+      $$("#pfilter button").forEach((x) => x.classList.toggle("active", x === b));
+      draw();
+    });
+    draw();
   }
 
   // =========================================================================
