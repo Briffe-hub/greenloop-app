@@ -934,7 +934,7 @@ Total : ${eur(total)}`;
             <input id="nb" type="number" value="10" min="1" max="200" />
             <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
           </div>
-          <div class="sub" style="margin-top:8px">💡 Pour ton imprimante Brother (rouleaux DK) : soit tu imprimes cette page directement en choisissant l'imprimante Brother, soit tu utilises le CSV (écran Matériel) dans P-touch Editor pour régler le nombre de copies.</div>
+          <div class="sub" style="margin-top:8px">💡 Format prévu pour un <b>rouleau continu 62 mm</b> (QR ≈ 5 cm, une étiquette par ticket). À l'impression, choisis l'imprimante Brother et le papier <b>62 mm</b> (marges « aucune »). Alternative : le CSV (écran Matériel) dans P-touch Editor.</div>
         </div>
         <div class="labels" id="labels"></div>
       </main>`;
@@ -951,7 +951,7 @@ Total : ${eur(total)}`;
         div.appendChild(qr);
         div.insertAdjacentHTML("beforeend", `<div class="lib">${esc(t.nom)}</div><div class="code">${esc(t.code_qr)}</div>`);
         box.appendChild(div);
-        new QRCode(qr, { text: t.code_qr, width: 120, height: 120, correctLevel: QRCode.CorrectLevel.M });
+        new QRCode(qr, { text: t.code_qr, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
       }
     };
     $("#apply").onclick = render;

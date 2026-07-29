@@ -141,16 +141,23 @@ textarea{min-height:70px;resize:vertical}
 .login-logo .leaf{font-size:34px}
 .login-sub{text-align:center;color:var(--muted);margin-bottom:26px;font-size:14px}
 
-/* Impression étiquettes QR */
+/* Impression étiquettes QR — rouleau continu Brother DK 62 mm (1 QR par ticket) */
+@page{ size:62mm auto; margin:0 }
 @media print{
-  body{padding:0;background:#fff}
+  html,body{padding:0;margin:0;background:#fff}
   .topbar,.nav,.no-print,.fab{display:none !important}
-  .labels{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm;padding:8mm}
-  .label{break-inside:avoid;border:1px dashed #999;border-radius:8px;padding:6mm;text-align:center}
-  .label .code{font-size:11px;margin-top:4px;font-family:monospace}
+  main{padding:0 !important}
+  .labels{display:block;margin:0}
+  .label{width:62mm;box-sizing:border-box;padding:3mm 0;text-align:center;border:0;border-radius:0;
+    page-break-after:always;break-after:page}
+  .label:last-child{page-break-after:auto}
+  .label canvas,.label img{width:50mm !important;height:50mm !important;margin:0 auto}
+  .label .lib{font-size:9pt;margin-top:1mm}
+  .label .code{font-size:8pt;margin-top:0.5mm;font-family:monospace}
 }
-.labels{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-top:12px}
-.label{border:1px solid var(--line);border-radius:10px;padding:12px;text-align:center;background:#fff}
-.label canvas,.label img{margin:0 auto}
-.label .code{font-size:11px;margin-top:6px;font-family:monospace;color:#444;word-break:break-all}
+/* Aperçu écran : chaque étiquette ressemble à un ticket 62 mm */
+.labels{display:flex;flex-direction:column;align-items:center;gap:12px;margin-top:12px}
+.label{width:62mm;box-sizing:border-box;border:1px dashed var(--line);border-radius:8px;padding:3mm 0;text-align:center;background:#fff}
+.label canvas,.label img{width:50mm;height:50mm;margin:0 auto}
+.label .code{font-size:11px;margin-top:4px;font-family:monospace;color:#444;word-break:break-all}
 .label .lib{font-size:12px;color:var(--muted);margin-top:2px}
