@@ -320,6 +320,11 @@
     const byCat = {};
     types.forEach((t) => ((byCat[t.categorie || "Autres"] ||= []).push(t)));
 
+    const typeById = {};
+    types.forEach((t) => (typeById[t.id] = t));
+    const typeOptions = '<option value="">— matériel —</option>' +
+      types.map((t) => `<option value="${t.id}">${esc(t.nom)}</option>`).join("");
+
     const lineHtml = (t) => `
       <div class="mat-line" data-line="${t.id}">
         <div class="name"><b>${esc(t.nom)}</b><small>${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR — saisie manuelle"}</small></div>
@@ -351,6 +356,14 @@
             </div>`).join("")}
         </div>
 
+        ${sens === "retour" ? `
+        <div class="section-title">⚠️ Casses & pertes constatées</div>
+        <div class="card">
+          <div class="sub" style="margin-bottom:6px">Vérifie l'intégrité du matériel. Déclare ici ce qui revient cassé ou ce qui manque — ce sera directement ajouté à facturer.</div>
+          <div id="cp-list"></div>
+          <button class="btn sec block" id="cp-add">＋ Déclarer une casse / perte</button>
+        </div>` : ""}
+
         <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
           <div class="row between" style="margin-bottom:8px">
             <b id="recap">0 pièce(s) ${verb}</b>
@@ -358,6 +371,29 @@
           <button class="btn ${sens==="sortie"?"":"sec"} block" id="valider">Valider ${label.toLowerCase()}</button>
         </div>
       </main>`;
+
+    // --- déclaration des casses/pertes (retour uniquement) ---
+    const cpAdd = $("#cp-add");
+    if (cpAdd) {
+      const addRow = () => {
+        const row = document.createElement("div");
+        row.className = "cp-row";
+        row.style.cssText = "border-top:1px solid var(--line);padding:10px 0";
+        row.innerHTML = `
+          <select class="cp-type" style="margin-bottom:6px">${typeOptions}</select>
+          <div class="row" style="gap:8px">
+            <select class="cp-motif" style="flex:1">
+              <option value="casse">🔨 Cassé</option>
+              <option value="perte">❓ Perdu / manquant</option>
+            </select>
+            <input type="number" class="cp-qty" inputmode="numeric" value="1" min="1" style="width:72px;text-align:center" />
+            <button class="btn sm ghost cp-rm" style="flex:0 0 auto;color:var(--danger)">✕</button>
+          </div>`;
+        $("#cp-list").appendChild(row);
+        row.querySelector(".cp-rm").onclick = () => row.remove();
+      };
+      cpAdd.onclick = addRow;
+    }
 
     const updateRecap = () => {
       const n = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -421,12 +457,36 @@
         if (counts[t.id] > 0)
           rows.push({ prestation_id: id, sens, type_id: t.id, unit_id: null, quantite: counts[t.id], par_user: state.user.id });
       });
-      if (!rows.length) return toast("Rien à valider", "err");
+
+      // casses & pertes déclarées (retour) -> facturations + règlement du solde
+      const facts = [];
+      $$(".cp-row").forEach((row) => {
+        const tid = row.querySelector(".cp-type").value;
+        const motif = row.querySelector(".cp-motif").value;
+        const qte = Math.max(0, parseInt(row.querySelector(".cp-qty").value) || 0);
+        if (!tid || qte <= 0) return;
+        const t = typeById[tid];
+        facts.push({
+          prestation_id: id, client_id: p.client_id || null, type_id: tid,
+          motif, quantite: qte, prix_unitaire: t ? t.prix_unitaire : 0, statut: "a_facturer",
+        });
+        // un cassé/perdu est "sorti du parc" chez le client : on le compte en retour
+        // pour qu'il n'apparaisse plus comme manquant (il est désormais facturé)
+        rows.push({ prestation_id: id, sens: "retour", type_id: tid, unit_id: null, quantite: qte, par_user: state.user.id });
+      });
+
+      if (!rows.length && !facts.length) return toast("Rien à valider", "err");
       $("#valider").disabled = true;
-      const { error } = await sb.from("mouvements").insert(rows);
-      if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
+      if (rows.length) {
+        const { error } = await sb.from("mouvements").insert(rows);
+        if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
+      }
+      if (facts.length) {
+        const { error } = await sb.from("facturations").insert(facts);
+        if (error) { $("#valider").disabled = false; return toast("Retour ok mais facturation : " + error.message, "err"); }
+      }
       stopScanner();
-      toast(label + " enregistrée ✔", "ok");
+      toast(facts.length ? `${label} + ${facts.length} à facturer ✔` : label + " enregistrée ✔", "ok");
       go("prestation/" + id);
     };
   }
