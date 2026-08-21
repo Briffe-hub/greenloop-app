@@ -20,6 +20,25 @@
 
   // ---- État global --------------------------------------------------------
   const state = { user: null, profile: null };
+  const isAdmin = () => state.profile && state.profile.role === "admin";
+
+  const MOTIF_LABEL = {
+    initial: "Parc initial", rachat: "Rachat", perte: "Perte (non retrouvé)",
+    casse_salarie: "Casse salarié", inventaire: "Correction d'inventaire", autre: "Autre",
+  };
+
+  // Recalcule le parc = somme des deltas du journal, et le met à jour sur le type
+  async function recomputeStock(typeId) {
+    const rows = await db.parcJournal(typeId);
+    const total = rows.reduce((a, r) => a + (r.delta || 0), 0);
+    await sb.from("materiel_types").update({ stock_total: total }).eq("id", typeId);
+    return total;
+  }
+  // Date+heure courtes
+  const dfrt = (iso) => {
+    try { return new Date(iso).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "2-digit", hour: "2-digit", minute: "2-digit" }); }
+    catch (e) { return iso; }
+  };
 
   // ---- Raccourcis DOM -----------------------------------------------------
   const app = document.getElementById("app");
@@ -69,6 +88,16 @@
     },
     setParam: (cle, valeur) => sb.from("parametres").upsert({ cle, valeur }),
     types: () => db.q("materiel_types", (q) => q.eq("actif", true).order("categorie").order("nom")),
+    typesArchived: () => db.q("materiel_types", (q) => q.eq("actif", false).order("nom")),
+    parcJournal: (tid) => db.q("parc_journal", (q) => q.eq("type_id", tid).order("created_at", { ascending: false })),
+    movementsByType: async (tid) => {
+      const { data, error } = await sb.from("mouvements")
+        .select("*, prestations(libelle, date_presta, clients(nom))")
+        .eq("type_id", tid).order("created_at", { ascending: false });
+      if (error) throw error;
+      return data;
+    },
+    usersList: () => db.q("profiles", (q) => q.order("nom")),
     type: async (id) => {
       const { data, error } = await sb.from("materiel_types").select("*").eq("id", id).single();
       if (error) throw error;
@@ -132,7 +161,10 @@
       }
       if (head === "nouvelle-presta") return viewPrestaForm();
       if (head === "materiel" && parts.length === 1) return viewMateriel();
+      if (head === "archives") return viewArchives();
       if (head === "categories") return viewCategories();
+      if (head === "journal") return viewParcJournal(parts[1]);
+      if (head === "admin") return viewAdmin();
       if (head === "type") return viewTypeDetail(parts[1]);
       if (head === "etiquettes") return viewEtiquettes(parts[1]);
       if (head === "clients") return viewClients();
@@ -803,7 +835,7 @@ Total : ${eur(total)} HT`;
   //  VUE : Matériel (catalogue)
   // =========================================================================
   async function viewMateriel() {
-    const [types, soldes] = await Promise.all([db.types(), db.soldeAll()]);
+    const [types, soldes, archived] = await Promise.all([db.types(), db.soldeAll(), db.typesArchived()]);
     const dehorsByType = {};
     soldes.forEach((s) => (dehorsByType[s.type_id] = (dehorsByType[s.type_id] || 0) + s.solde));
 
@@ -832,9 +864,48 @@ Total : ${eur(total)} HT`;
           <button class="btn sec" id="csv">⬇︎ Export CSV</button>
         </div>
         ${types.length ? body : '<div class="empty"><div class="big">📦</div>Aucun matériel.</div>'}
+        ${archived.length ? `<button class="btn ghost block" style="margin-top:16px" onclick="location.hash='#/archives'">🗄 Matériel archivé (${archived.length})</button>` : ""}
       </main>
        <button class="fab" onclick="location.hash='#/type/new'">＋</button>`;
     $("#csv").onclick = () => exportTypesCSV(types);
+  }
+
+  // =========================================================================
+  //  VUE : Matériel archivé (réactivation / suppression définitive)
+  // =========================================================================
+  async function viewArchives() {
+    const archived = await db.typesArchived();
+    app.innerHTML =
+      topbar("Matériel archivé", { back: "materiel" }) +
+      `<main>
+        ${archived.length ? `<div class="sub" style="margin-bottom:8px">Ces matériels sont masqués mais leur historique est conservé. Tu peux les réactiver.</div>` +
+          archived.map((t) => `
+            <div class="card">
+              <div class="row between" style="margin-bottom:8px">
+                <div class="grow"><b>${esc(t.nom)}</b><div class="sub">${esc(t.categorie || "")}${t.code_qr ? " · " + esc(t.code_qr) : ""}</div></div>
+              </div>
+              <div class="btn-grid">
+                <button class="btn sec" data-reactiver="${t.id}">↩︎ Réactiver</button>
+                <button class="btn ghost" data-suppr="${t.id}" style="color:var(--danger)">🗑 Supprimer définitivement</button>
+              </div>
+            </div>`).join("")
+          : `<div class="empty"><div class="big">🗄</div>Aucun matériel archivé.</div>`}
+      </main>`;
+
+    $$("[data-reactiver]").forEach((b) => b.onclick = async () => {
+      const { error } = await sb.from("materiel_types").update({ actif: true }).eq("id", b.dataset.reactiver);
+      toast(error ? error.message : "Matériel réactivé ✔", error ? "err" : "ok");
+      if (!error) render();
+    });
+    $$("[data-suppr]").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) { armed = true; b.textContent = "Confirmer ?"; setTimeout(() => { armed = false; b.textContent = "🗑 Supprimer définitivement"; }, 3000); return; }
+        const { error } = await sb.from("materiel_types").delete().eq("id", b.dataset.suppr);
+        if (error) return toast("Impossible : ce matériel a un historique. Il reste archivé.", "err");
+        toast("Supprimé définitivement ✔", "ok"); render();
+      };
+    });
   }
 
   // =========================================================================
@@ -889,6 +960,144 @@ Total : ${eur(total)} HT`;
     });
   }
 
+  // =========================================================================
+  //  VUE : Journal du parc d'un matériel
+  // =========================================================================
+  async function viewParcJournal(tid) {
+    const t = await db.type(tid);
+    const [journal, mvts] = await Promise.all([db.parcJournal(tid), db.movementsByType(tid)]);
+    const admin = isAdmin();
+    const items = [
+      ...journal.map((j) => ({ at: j.created_at, kind: "parc", j })),
+      ...mvts.map((m) => ({ at: m.created_at, kind: "mvt", m })),
+    ].sort((a, b) => (a.at < b.at ? 1 : -1));
+
+    const parcLine = (j) => {
+      const sign = j.delta > 0 ? "+" : "";
+      return `<div class="mat-line" data-pj="${j.id}">
+        <div class="name" style="flex:1"><b>🧮 ${esc(MOTIF_LABEL[j.motif] || j.motif)} : ${sign}${j.delta}</b>
+          <small>${dfrt(j.created_at)}${j.commentaire ? " · " + esc(j.commentaire) : ""}</small></div>
+        ${admin ? `<button class="btn sm ghost pj-edit" data-id="${j.id}" style="flex:0 0 auto">✏️</button>` : ""}
+      </div>`;
+    };
+    const mvtLine = (m) => {
+      const cli = m.prestations && m.prestations.clients ? m.prestations.clients.nom : "";
+      const pres = m.prestations ? m.prestations.libelle : "";
+      return `<div class="mat-line"><div class="name" style="flex:1">
+        <b>${m.sens === "sortie" ? "📤 Sortie" : "📥 Retour"} ${m.quantite}</b>
+        <small>${dfrt(m.created_at)}${cli ? " · " + esc(cli) : ""}${pres ? " · " + esc(pres) : ""}</small></div></div>`;
+    };
+
+    app.innerHTML =
+      topbar("Journal · " + t.nom, { back: "type/" + tid }) +
+      `<main>
+        <div class="card"><div class="row between"><b>Parc actuel</b><b style="font-size:20px">${t.stock_total || 0}</b></div></div>
+        ${admin ? `
+          <div class="card">
+            <div class="sub" style="font-weight:700;margin-bottom:6px">Ajuster le parc</div>
+            <div class="field-row">
+              <div><label style="margin-top:0">Variation</label><input id="adj-delta" type="number" placeholder="+10 / −3" /></div>
+              <div><label style="margin-top:0">Motif</label>
+                <select id="adj-motif">
+                  <option value="rachat">Rachat</option>
+                  <option value="perte">Perte (non retrouvé)</option>
+                  <option value="casse_salarie">Casse salarié</option>
+                  <option value="inventaire">Correction d'inventaire</option>
+                  <option value="autre">Autre</option>
+                </select></div>
+            </div>
+            <input id="adj-com" placeholder="Commentaire (optionnel)" style="margin-top:6px" />
+            <button class="btn block" id="adj-save" style="margin-top:8px">Enregistrer l'ajustement</button>
+          </div>` : `<div class="sub" style="margin:4px">🔒 Seul un administrateur peut ajuster le parc.</div>`}
+        <div class="section-title">Historique</div>
+        <div class="card" id="tl">${items.length ? items.map((it) => it.kind === "parc" ? parcLine(it.j) : mvtLine(it.m)).join("") : '<div class="sub">Aucun mouvement.</div>'}</div>
+      </main>`;
+
+    if (admin) {
+      $("#adj-save").onclick = async () => {
+        const delta = parseInt($("#adj-delta").value);
+        if (!delta) return toast("Indique une variation (ex : 10 ou -3)", "err");
+        const { error } = await sb.from("parc_journal").insert({
+          type_id: tid, delta, motif: $("#adj-motif").value,
+          commentaire: $("#adj-com").value.trim() || null, par_user: state.user.id,
+        });
+        if (error) return toast(error.message, "err");
+        await recomputeStock(tid);
+        toast("Parc ajusté ✔", "ok"); render();
+      };
+      $$(".pj-edit").forEach((b) => b.onclick = () => editParcEntry(b.dataset.id, journal, tid));
+    }
+  }
+
+  function editParcEntry(id, journal, tid) {
+    const j = journal.find((x) => x.id === id);
+    const line = $(`[data-pj="${id}"]`);
+    if (!j || !line) return;
+    line.innerHTML = `<div style="flex:1">
+      <div class="field-row">
+        <input class="pe-delta" type="number" value="${j.delta}" />
+        <select class="pe-motif">${Object.keys(MOTIF_LABEL).map((m) => `<option value="${m}" ${j.motif === m ? "selected" : ""}>${esc(MOTIF_LABEL[m])}</option>`).join("")}</select>
+      </div>
+      <input class="pe-com" value="${esc(j.commentaire || "")}" placeholder="Commentaire" style="margin-top:6px" />
+      <div class="btn-grid" style="margin-top:6px">
+        <button class="btn sec pe-save">Enregistrer</button>
+        <button class="btn ghost pe-del" style="color:var(--danger)">Supprimer</button>
+      </div></div>`;
+    line.querySelector(".pe-save").onclick = async () => {
+      const delta = parseInt(line.querySelector(".pe-delta").value) || 0;
+      const { error } = await sb.from("parc_journal").update({
+        delta, motif: line.querySelector(".pe-motif").value,
+        commentaire: line.querySelector(".pe-com").value.trim() || null,
+      }).eq("id", id);
+      if (error) return toast(error.message, "err");
+      await recomputeStock(tid); toast("Modifié ✔", "ok"); render();
+    };
+    line.querySelector(".pe-del").onclick = async () => {
+      const { error } = await sb.from("parc_journal").delete().eq("id", id);
+      if (error) return toast(error.message, "err");
+      await recomputeStock(tid); toast("Entrée supprimée ✔", "ok"); render();
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Espace admin (équipe + réglages)
+  // =========================================================================
+  async function viewAdmin() {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Admin") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const [users, compta] = await Promise.all([db.usersList(), db.param("email_compta")]);
+    app.innerHTML =
+      topbar("Espace admin") +
+      `<main>
+        <div class="section-title">Équipe</div>
+        ${users.map((u) => `
+          <div class="card"><div class="row between">
+            <div class="grow"><b>${esc(u.nom || "—")}</b><div class="sub">${u.role === "admin" ? "👑 Administrateur" : "Livreur"}</div></div>
+            <button class="btn sm ${u.role === "admin" ? "ghost" : "sec"} role-toggle" data-id="${u.id}" data-role="${u.role}" style="flex:0 0 auto">${u.role === "admin" ? "Rétrograder" : "Passer admin"}</button>
+          </div></div>`).join("")}
+        <div class="section-title">Facturation</div>
+        <div class="card">
+          <label>Email du service comptabilité</label>
+          <input id="a-compta" type="email" value="${esc(compta)}" placeholder="compta@briffe.me" />
+          <button class="btn block" id="a-compta-save" style="margin-top:8px">Enregistrer</button>
+        </div>
+      </main>`;
+    $$(".role-toggle").forEach((b) => b.onclick = async () => {
+      const newRole = b.dataset.role === "admin" ? "livreur" : "admin";
+      if (b.dataset.id === state.user.id && newRole !== "admin")
+        return toast("Tu ne peux pas te retirer ton propre rôle admin.", "err");
+      const { error } = await sb.from("profiles").update({ role: newRole }).eq("id", b.dataset.id);
+      if (error) return toast(error.message, "err");
+      toast("Rôle mis à jour ✔", "ok"); render();
+    });
+    $("#a-compta-save").onclick = async () => {
+      const { error } = await db.setParam("email_compta", $("#a-compta").value.trim());
+      toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
+    };
+  }
+
   // Export CSV (nom;categorie;code_qr;prix) pour fusion Brother P-touch Editor
   function exportTypesCSV(types) {
     const head = "nom;categorie;code_qr;prix_remplacement";
@@ -917,15 +1126,18 @@ Total : ${eur(total)} HT`;
     const isNew = tid === "new";
     let t = { nom: "", categorie: "", unite: "pièce", prix_unitaire: 0, code_qr: "", stock_total: 0 };
     const cats = await db.categories();
-    let soldes = [], clientsMap = {};
+    let soldes = [], clientsMap = {}, journal = [];
     if (!isNew) {
       t = await db.type(tid);
-      const [allSoldes, clients] = await Promise.all([db.soldeAll(), db.clients()]);
+      const [allSoldes, clients, j] = await Promise.all([db.soldeAll(), db.clients(), db.parcJournal(tid)]);
       soldes = allSoldes.filter((s) => s.type_id === tid && s.solde !== 0);
       clients.forEach((c) => (clientsMap[c.id] = c.nom));
+      journal = j;
     }
     const dehors = soldes.reduce((a, s) => a + s.solde, 0);
     const labo = (t.stock_total || 0) - dehors;
+    // Le parc est "verrouillé" dès qu'il a été initialisé (journal non vide)
+    const parkLocked = !isNew && journal.length > 0;
 
     app.innerHTML =
       topbar(isNew ? "Nouveau matériel" : t.nom, { back: "materiel" }) +
@@ -941,8 +1153,10 @@ Total : ${eur(total)} HT`;
           <input id="t-cat-new" placeholder="Nom de la nouvelle catégorie" style="display:none;margin-top:6px" />
           <div class="field-row">
             <div><label>Prix de remplacement HT (€)</label><input id="t-prix" type="number" step="0.01" value="${t.prix_unitaire}" /></div>
-            <div><label>Quantité totale (parc)</label><input id="t-stock" type="number" step="1" value="${t.stock_total || 0}" /></div>
+            <div><label>Quantité totale (parc)${parkLocked ? " 🔒" : ""}</label>
+              <input id="t-stock" type="number" step="1" value="${t.stock_total || 0}" ${parkLocked ? "readonly style=\"background:#f1f3f0\"" : ""} /></div>
           </div>
+          ${parkLocked ? `<div class="sub" style="margin-top:-4px">Le parc est verrouillé après la 1ʳᵉ saisie. Toute modification passe par le <b>journal du parc</b> (admin) avec justification.</div>` : `<div class="sub" style="margin-top:-4px">Première saisie du parc : indique la quantité possédée. Ensuite, elle ne sera modifiable que par un admin avec justification.</div>`}
           <label>Code QR (identique sur tous les exemplaires de ce type)</label>
           <div class="field-row">
             <input id="t-code" value="${esc(t.code_qr||"")}" placeholder="GL-…" style="font-family:monospace" />
@@ -964,7 +1178,8 @@ Total : ${eur(total)} HT`;
               <div class="name" style="flex:1">${esc(clientsMap[s.client_id] || "Client ?")}</div>
               <span class="badge amber">${s.solde}</span></div>`).join("")}
           </div>` : `<div class="sub" style="margin-top:8px">Aucun exemplaire chez un client actuellement.</div>`}
-          ${labo < 0 ? `<div class="sub" style="color:var(--danger);margin-top:8px">⚠️ « Dehors » dépasse le parc — augmente la quantité totale du parc.</div>` : ""}
+          ${labo < 0 ? `<div class="sub" style="color:var(--danger);margin-top:8px">⚠️ « Dehors » dépasse le parc — ajuste le parc via le journal.</div>` : ""}
+          <button class="btn sec block" style="margin-top:12px" onclick="location.hash='#/journal/${tid}'">📜 Journal du parc</button>
         ` : ""}
 
         ${!isNew && t.code_qr ? `
@@ -999,28 +1214,37 @@ Total : ${eur(total)} HT`;
         categorie = $("#t-cat-new").value.trim();
         if (categorie) await sb.from("materiel_categories").insert({ nom: categorie }).then(() => {}, () => {});
       }
+      const parcInitial = parkLocked ? (t.stock_total || 0) : (parseInt($("#t-stock").value) || 0);
       const payload = {
         nom,
         categorie: categorie || null,
         prix_unitaire: parseFloat($("#t-prix").value) || 0,
-        stock_total: parseInt($("#t-stock").value) || 0,
+        stock_total: parcInitial,
         code_qr: code || null,
       };
       $("#save").disabled = true;
-      let error;
+      let error, newId = tid;
       if (isNew) {
         const res = await sb.from("materiel_types").insert(payload).select().single();
         error = res.error;
-        if (!error) return go("type/" + res.data.id);
+        if (!error) newId = res.data.id;
       } else {
         error = (await sb.from("materiel_types").update(payload).eq("id", tid)).error;
       }
-      $("#save").disabled = false;
       if (error) {
+        $("#save").disabled = false;
         return toast(error.message.includes("duplicate") || error.code === "23505"
           ? "Ce code QR est déjà utilisé par un autre type" : error.message, "err");
       }
+      // Première saisie du parc -> on l'inscrit au journal (motif "initial")
+      if (!parkLocked && parcInitial > 0) {
+        await sb.from("parc_journal").insert({
+          type_id: newId, delta: parcInitial, motif: "initial",
+          commentaire: "Saisie initiale du parc", par_user: state.user.id,
+        });
+      }
       toast("Enregistré ✔", "ok");
+      if (isNew) return go("type/" + newId);
       render();
     };
 
@@ -1486,6 +1710,14 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
     state.user = data.user;
     const { data: prof } = await sb.from("profiles").select("*").eq("id", data.user.id).maybeSingle();
     state.profile = prof;
+    // Onglet Admin (uniquement pour les admins)
+    if (isAdmin() && !$("#nav-admin")) {
+      const b = document.createElement("button");
+      b.id = "nav-admin";
+      b.dataset.route = "admin";
+      b.innerHTML = '<span class="ico">🔐</span>Admin';
+      nav.appendChild(b);
+    }
     if (!location.hash) location.hash = "#/prestations";
     render();
   }
