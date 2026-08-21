@@ -973,6 +973,8 @@ Total : ${eur(total)} HT`;
             <div class="code">${esc(t.code_qr)}</div>
             <button class="btn ghost block" onclick="location.hash='#/etiquettes/${tid}'">🖨️ Imprimer les étiquettes (choisir le nombre)</button>
           </div>` : ""}
+
+        ${!isNew ? `<button class="btn ghost block" id="del-type" style="color:var(--danger);margin-top:16px">🗑 Supprimer ce matériel</button>` : ""}
       </main>`;
 
     // catégorie : afficher le champ "nouvelle" si choisi
@@ -1021,6 +1023,37 @@ Total : ${eur(total)} HT`;
       toast("Enregistré ✔", "ok");
       render();
     };
+
+    // suppression (ou archivage si un historique existe)
+    const delBtn = $("#del-type");
+    if (delBtn) {
+      let armed = false;
+      delBtn.onclick = async () => {
+        if (!armed) {
+          armed = true;
+          delBtn.textContent = "Confirmer la suppression ?";
+          delBtn.classList.remove("ghost"); delBtn.classList.add("danger");
+          setTimeout(() => {
+            if (!armed) return;
+            armed = false;
+            delBtn.textContent = "🗑 Supprimer ce matériel";
+            delBtn.classList.add("ghost"); delBtn.classList.remove("danger");
+          }, 4000);
+          return;
+        }
+        delBtn.disabled = true;
+        const { error } = await sb.from("materiel_types").delete().eq("id", tid);
+        if (error) {
+          // référencé par des mouvements/facturations -> on archive au lieu de casser l'historique
+          const { error: e2 } = await sb.from("materiel_types").update({ actif: false }).eq("id", tid);
+          if (e2) { delBtn.disabled = false; return toast(e2.message, "err"); }
+          toast("Matériel archivé (un historique existe, données conservées)", "ok");
+        } else {
+          toast("Matériel supprimé ✔", "ok");
+        }
+        go("materiel");
+      };
+    }
   }
 
   // =========================================================================
