@@ -934,7 +934,7 @@ Total : ${eur(total)}`;
             <input id="nb" type="number" value="10" min="1" max="200" />
             <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
           </div>
-          <div class="sub" style="margin-top:8px">💡 Format prévu pour un <b>rouleau continu 62 mm</b> (QR ≈ 5 cm, une étiquette par ticket). À l'impression, choisis l'imprimante Brother et le papier <b>62 mm</b> (marges « aucune »). Alternative : le CSV (écran Matériel) dans P-touch Editor.</div>
+          <div class="sub" style="margin-top:8px">💡 Étiquette <b>carrée 62 × 62 mm</b>. À l'impression, choisis l'imprimante Brother et le papier <b>« 62mm x 1m »</b> (rouleau continu), échelle <b>100 %</b> / « ajuster à la page » désactivé. Alternative : le CSV (écran Matériel) dans P-touch Editor pour un format sur mesure.</div>
         </div>
         <div class="labels" id="labels"></div>
       </main>`;
