@@ -59,6 +59,8 @@
       return data;
     },
     soldeClient: (cid) => db.q("v_solde_client", (q) => q.eq("client_id", cid)),
+    soldeAll: () => db.q("v_solde_client"),
+    categories: () => db.q("materiel_categories", (q) => q.order("nom")),
     prestationsByClient: (cid) =>
       db.q("prestations", (q) => q.eq("client_id", cid).order("date_presta", { ascending: false })),
     param: async (cle) => {
@@ -130,6 +132,7 @@
       }
       if (head === "nouvelle-presta") return viewPrestaForm();
       if (head === "materiel" && parts.length === 1) return viewMateriel();
+      if (head === "categories") return viewCategories();
       if (head === "type") return viewTypeDetail(parts[1]);
       if (head === "etiquettes") return viewEtiquettes(parts[1]);
       if (head === "clients") return viewClients();
@@ -647,7 +650,7 @@
         if (d.nonrec === 0) { lbl.innerHTML = "✔ complet"; lbl.style.color = "var(--ok)"; }
         else { lbl.innerHTML = `${d.nonrec} non récupéré(s) → ${eur(d.nonrec * d.prix)}`; lbl.style.color = "var(--danger)"; }
       });
-      const r = $("#recap-rec"); if (r) r.textContent = "À facturer : " + eur(total);
+      const r = $("#recap-rec"); if (r) r.textContent = "À facturer : " + eur(total) + " HT";
     };
     // Récupéré et Non récupéré sont complémentaires : éditer l'un ajuste l'autre
     app.querySelector("main").addEventListener("input", (e) => {
@@ -706,7 +709,7 @@ Date : ${dfr(p.date_presta)}
 Matériel non récupéré à facturer :
 ${manquantsTxt.join("\n")}
 
-Total : ${eur(total)}`;
+Total : ${eur(total)} HT`;
         if (compta) openMail(compta, `Matériel à facturer — ${cli} (${p.libelle || ""})`, body);
         else toast("Récup enregistrée. Renseigne l'email compta dans Paramètres pour l'envoi auto.", "ok");
       } else {
@@ -745,7 +748,7 @@ Total : ${eur(total)}`;
                   <div class="grow"><b>${esc(b.type_nom)}</b><div class="sub">${esc(b.categorie||"")} · ${b.q_sortie} sortis, ${b.q_retour} revenus</div></div>
                   <span class="badge red">${b.q_manquant} manquant${b.q_manquant>1?"s":""}</span>
                 </div>
-                <div class="sub" style="margin-top:6px">Remplacement estimé : ${eur(b.q_manquant * b.prix_unitaire)} (${eur(b.prix_unitaire)}/u)</div>
+                <div class="sub" style="margin-top:6px">Remplacement estimé : ${eur(b.q_manquant * b.prix_unitaire)} HT (${eur(b.prix_unitaire)} HT/u)</div>
                 <div class="btn-grid" style="margin-top:10px">
                   <button class="btn warn sm" data-fact='${b.type_id}|casse'>Facturer (casse)</button>
                   <button class="btn danger sm" data-fact='${b.type_id}|perte'>Facturer (perte)</button>
@@ -775,7 +778,7 @@ Date : ${dfr(p.date_presta)}
 Matériel manquant à facturer :
 ${lignes}
 
-Total : ${eur(total)}`;
+Total : ${eur(total)} HT`;
       openMail(compta, `Manquants à facturer — ${cli} (${p.libelle || ""})`, body);
     };
 
@@ -800,28 +803,90 @@ Total : ${eur(total)}`;
   //  VUE : Matériel (catalogue)
   // =========================================================================
   async function viewMateriel() {
-    const types = await db.types();
+    const [types, soldes] = await Promise.all([db.types(), db.soldeAll()]);
+    const dehorsByType = {};
+    soldes.forEach((s) => (dehorsByType[s.type_id] = (dehorsByType[s.type_id] || 0) + s.solde));
+
     const byCat = {};
     types.forEach((t) => ((byCat[t.categorie || "Autres"] ||= []).push(t)));
-    const body = Object.keys(byCat).sort().map((cat) => `
-      <div class="section-title">${esc(cat)}</div>
-      ${byCat[cat].map((t) => `
+    const card = (t) => {
+      const dehors = dehorsByType[t.id] || 0;
+      const labo = (t.stock_total || 0) - dehors;
+      return `
         <div class="card tap" onclick="location.hash='#/type/${t.id}'">
           <div class="grow"><h3>${esc(t.nom)}</h3>
-            <div class="sub">${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR"} · ${eur(t.prix_unitaire)}/u</div></div>
+            <div class="sub">${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR"} · ${eur(t.prix_unitaire)} HT</div>
+            <div class="sub">Parc <b>${t.stock_total || 0}</b> · 🏭 Labo <b>${labo}</b> · 🚚 Dehors <b>${dehors}</b></div>
+          </div>
           <div style="font-size:22px;color:#cbd5c9">›</div>
-        </div>`).join("")}
-    `).join("");
+        </div>`;
+    };
+    const body = Object.keys(byCat).sort().map((cat) =>
+      `<div class="section-title">${esc(cat)}</div>${byCat[cat].map(card).join("")}`).join("");
 
     app.innerHTML =
-      topbar("Matériel", { action: "⬇︎ CSV" }) +
+      topbar("Matériel") +
       `<main>
+        <div class="btn-grid" style="margin-bottom:12px">
+          <button class="btn sec" onclick="location.hash='#/categories'">🏷️ Catégories</button>
+          <button class="btn sec" id="csv">⬇︎ Export CSV</button>
+        </div>
         ${types.length ? body : '<div class="empty"><div class="big">📦</div>Aucun matériel.</div>'}
-        <div class="sub no-print" style="margin-top:16px">Le bouton « CSV » exporte tous les types + leur code QR, pour générer/réimprimer les étiquettes en lot dans Brother P-touch Editor.</div>
       </main>
        <button class="fab" onclick="location.hash='#/type/new'">＋</button>`;
-    const csvBtn = $("#tb-action");
-    if (csvBtn) csvBtn.onclick = () => exportTypesCSV(types);
+    $("#csv").onclick = () => exportTypesCSV(types);
+  }
+
+  // =========================================================================
+  //  VUE : Gestion des catégories de matériel
+  // =========================================================================
+  async function viewCategories() {
+    const cats = await db.categories();
+    app.innerHTML =
+      topbar("Catégories", { back: "materiel" }) +
+      `<main>
+        <div class="card">
+          <label>Nouvelle catégorie</label>
+          <div class="field-row">
+            <input id="c-new" placeholder="Ex : Contenants" />
+            <button class="btn sm" id="c-add" style="flex:0 0 auto">Ajouter</button>
+          </div>
+        </div>
+        <div class="section-title">Catégories existantes</div>
+        ${cats.length ? cats.map((c) => `
+          <div class="card"><div class="row" style="gap:8px">
+            <input class="cat-nom" data-id="${c.id}" data-old="${esc(c.nom)}" value="${esc(c.nom)}" style="flex:1" />
+            <button class="btn sm sec cat-save" data-id="${c.id}" style="flex:0 0 auto">✓</button>
+            <button class="btn sm ghost cat-del" data-id="${c.id}" data-nom="${esc(c.nom)}" style="flex:0 0 auto;color:var(--danger)">🗑</button>
+          </div></div>`).join("") : '<div class="sub">Aucune catégorie pour l\'instant.</div>'}
+      </main>`;
+
+    $("#c-add").onclick = async () => {
+      const nom = $("#c-new").value.trim();
+      if (!nom) return;
+      const { error } = await sb.from("materiel_categories").insert({ nom });
+      if (error) return toast(error.message.includes("duplicate") ? "Cette catégorie existe déjà" : error.message, "err");
+      toast("Catégorie ajoutée ✔", "ok"); render();
+    };
+    $$(".cat-save").forEach((b) => b.onclick = async () => {
+      const inp = $(`.cat-nom[data-id="${b.dataset.id}"]`);
+      const nouveau = inp.value.trim(), ancien = inp.dataset.old;
+      if (!nouveau || nouveau === ancien) return;
+      const e1 = (await sb.from("materiel_categories").update({ nom: nouveau }).eq("id", b.dataset.id)).error;
+      if (e1) return toast(e1.message, "err");
+      await sb.from("materiel_types").update({ categorie: nouveau }).eq("categorie", ancien);
+      toast("Catégorie renommée ✔", "ok"); render();
+    });
+    $$(".cat-del").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) { armed = true; b.textContent = "Confirmer ?"; setTimeout(() => { armed = false; b.textContent = "🗑"; }, 3000); return; }
+        await sb.from("materiel_types").update({ categorie: null }).eq("categorie", b.dataset.nom);
+        const { error } = await sb.from("materiel_categories").delete().eq("id", b.dataset.id);
+        if (error) return toast(error.message, "err");
+        toast("Catégorie supprimée ✔", "ok"); render();
+      };
+    });
   }
 
   // Export CSV (nom;categorie;code_qr;prix) pour fusion Brother P-touch Editor
@@ -850,17 +915,34 @@ Total : ${eur(total)}`;
 
   async function viewTypeDetail(tid) {
     const isNew = tid === "new";
-    let t = { nom: "", categorie: "", unite: "pièce", prix_unitaire: 0, code_qr: "" };
-    if (!isNew) t = await db.type(tid);
+    let t = { nom: "", categorie: "", unite: "pièce", prix_unitaire: 0, code_qr: "", stock_total: 0 };
+    const cats = await db.categories();
+    let soldes = [], clientsMap = {};
+    if (!isNew) {
+      t = await db.type(tid);
+      const [allSoldes, clients] = await Promise.all([db.soldeAll(), db.clients()]);
+      soldes = allSoldes.filter((s) => s.type_id === tid && s.solde !== 0);
+      clients.forEach((c) => (clientsMap[c.id] = c.nom));
+    }
+    const dehors = soldes.reduce((a, s) => a + s.solde, 0);
+    const labo = (t.stock_total || 0) - dehors;
 
     app.innerHTML =
       topbar(isNew ? "Nouveau matériel" : t.nom, { back: "materiel" }) +
       `<main>
         <div class="card">
           <label>Nom</label><input id="t-nom" value="${esc(t.nom)}" placeholder="Ex : Caisse Araven 20L" />
-          <label>Catégorie</label><input id="t-cat" value="${esc(t.categorie||"")}" placeholder="Caisses, Vaisselle…" />
-          <label>Prix de remplacement (€) — sert à la facturation casse/perte</label>
-          <input id="t-prix" type="number" step="0.01" value="${t.prix_unitaire}" />
+          <label>Catégorie</label>
+          <select id="t-cat">
+            <option value="">— Choisir —</option>
+            ${cats.map((c) => `<option value="${esc(c.nom)}" ${t.categorie === c.nom ? "selected" : ""}>${esc(c.nom)}</option>`).join("")}
+            <option value="__new__">＋ Nouvelle catégorie…</option>
+          </select>
+          <input id="t-cat-new" placeholder="Nom de la nouvelle catégorie" style="display:none;margin-top:6px" />
+          <div class="field-row">
+            <div><label>Prix de remplacement HT (€)</label><input id="t-prix" type="number" step="0.01" value="${t.prix_unitaire}" /></div>
+            <div><label>Quantité totale (parc)</label><input id="t-stock" type="number" step="1" value="${t.stock_total || 0}" /></div>
+          </div>
           <label>Code QR (identique sur tous les exemplaires de ce type)</label>
           <div class="field-row">
             <input id="t-code" value="${esc(t.code_qr||"")}" placeholder="GL-…" style="font-family:monospace" />
@@ -869,13 +951,34 @@ Total : ${eur(total)}`;
           <button class="btn block" id="save">${isNew?"Créer":"Enregistrer"}</button>
         </div>
 
+        ${!isNew ? `
+          <div class="section-title">Stock à l'instant T</div>
+          <div class="stat">
+            <div class="box"><div class="n">${t.stock_total || 0}</div><div class="l">Parc</div></div>
+            <div class="box"><div class="n green">${labo}</div><div class="l">🏭 Labo</div></div>
+            <div class="box"><div class="n ${dehors ? "amber" : ""}">${dehors}</div><div class="l">🚚 Dehors</div></div>
+          </div>
+          ${soldes.length ? `<div class="card" style="margin-top:10px">
+            <div class="sub" style="font-weight:700;margin-bottom:4px">Détenu par client</div>
+            ${soldes.sort((a, b) => b.solde - a.solde).map((s) => `<div class="mat-line" onclick="location.hash='#/client/${s.client_id}'" style="cursor:pointer">
+              <div class="name" style="flex:1">${esc(clientsMap[s.client_id] || "Client ?")}</div>
+              <span class="badge amber">${s.solde}</span></div>`).join("")}
+          </div>` : `<div class="sub" style="margin-top:8px">Aucun exemplaire chez un client actuellement.</div>`}
+          ${labo < 0 ? `<div class="sub" style="color:var(--danger);margin-top:8px">⚠️ « Dehors » dépasse le parc — augmente la quantité totale du parc.</div>` : ""}
+        ` : ""}
+
         ${!isNew && t.code_qr ? `
-          <div class="card" style="text-align:center">
+          <div class="card" style="text-align:center;margin-top:12px">
             <div id="qr-preview" style="display:flex;justify-content:center;margin:6px 0"></div>
             <div class="code">${esc(t.code_qr)}</div>
             <button class="btn ghost block" onclick="location.hash='#/etiquettes/${tid}'">🖨️ Imprimer les étiquettes (choisir le nombre)</button>
           </div>` : ""}
       </main>`;
+
+    // catégorie : afficher le champ "nouvelle" si choisi
+    $("#t-cat").onchange = (e) => {
+      $("#t-cat-new").style.display = e.target.value === "__new__" ? "block" : "none";
+    };
 
     // aperçu du QR
     const prev = $("#qr-preview");
@@ -888,10 +991,17 @@ Total : ${eur(total)}`;
       if (!nom) return toast("Ajoute un nom", "err");
       let code = $("#t-code").value.trim();
       if (!code) code = slugCode(nom);            // auto si vide
+      // catégorie : valeur choisie, ou nouvelle saisie
+      let categorie = $("#t-cat").value;
+      if (categorie === "__new__") {
+        categorie = $("#t-cat-new").value.trim();
+        if (categorie) await sb.from("materiel_categories").insert({ nom: categorie }).then(() => {}, () => {});
+      }
       const payload = {
         nom,
-        categorie: $("#t-cat").value.trim() || null,
+        categorie: categorie || null,
         prix_unitaire: parseFloat($("#t-prix").value) || 0,
+        stock_total: parseInt($("#t-stock").value) || 0,
         code_qr: code || null,
       };
       $("#save").disabled = true;
@@ -1069,11 +1179,11 @@ Total : ${eur(total)}`;
           : `<div class="card">
               ${solde.map((x) => `
                 <div class="mat-line">
-                  <div class="name"><b>${esc(x.type_nom)}</b><small>${esc(x.categorie || "")} · ${eur(x.prix_unitaire)}/u</small></div>
+                  <div class="name"><b>${esc(x.type_nom)}</b><small>${esc(x.categorie || "")} · ${eur(x.prix_unitaire)} HT/u</small></div>
                   <span class="badge ${x.solde > 0 ? "amber" : "green"}">${x.solde}</span>
                 </div>`).join("")}
               <div class="divider"></div>
-              <div class="row between"><b>${totalPieces} pièce(s)</b><b>${eur(totalValeur)}</b></div>
+              <div class="row between"><b>${totalPieces} pièce(s)</b><b>${eur(totalValeur)} HT</b></div>
             </div>`}
 
         ${solde.length ? `
@@ -1140,7 +1250,7 @@ Voici le récapitulatif du matériel BRIFFE actuellement en votre possession :
 
 ${lignes}
 
-Total : ${totalPieces} pièce(s), valeur de remplacement ${eur(totalValeur)}.
+Total : ${totalPieces} pièce(s), valeur de remplacement ${eur(totalValeur)} HT.
 
 Merci de nous signaler tout élément manquant, cassé ou perdu afin de régulariser.
 
@@ -1155,7 +1265,7 @@ L'équipe BRIFFE`;
 
 ${lignes}
 
-Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} à facturer.`;
+Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         openMail(compta, `Matériel à facturer — ${c.nom}`, body);
       }
     };
