@@ -870,6 +870,7 @@ Total : ${eur(total)} HT`;
       const labo = (t.stock_total || 0) - dehors;
       return `
         <div class="card tap" onclick="location.hash='#/type/${t.id}'">
+          ${t.photo_url ? `<img src="${esc(t.photo_url)}" alt="" style="width:52px;height:52px;border-radius:10px;object-fit:cover;flex:0 0 auto;background:#eef0ee" />` : `<div style="width:52px;height:52px;border-radius:10px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:24px">📦</div>`}
           <div class="grow"><h3>${esc(t.nom)}</h3>
             <div class="sub">${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR"} · ${eur(t.prix_unitaire)} HT</div>
             <div class="sub">Parc <b>${t.stock_total || 0}</b> · 🏭 Labo <b>${labo}</b> · 🚚 Dehors <b>${dehors}</b></div>
@@ -1138,6 +1139,25 @@ Total : ${eur(total)} HT`;
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   }
 
+  // Redimensionne/compresse une image côté client avant envoi (photos téléphone = lourdes)
+  function resizeImage(file, maxDim = 1200, quality = 0.82) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) { height = Math.round(height * maxDim / width); width = maxDim; }
+        else if (height >= width && height > maxDim) { width = Math.round(width * maxDim / height); height = maxDim; }
+        const c = document.createElement("canvas");
+        c.width = width; c.height = height;
+        c.getContext("2d").drawImage(img, 0, 0, width, height);
+        c.toBlob((b) => b ? resolve(b) : reject(new Error("conversion échouée")), "image/jpeg", quality);
+        URL.revokeObjectURL(img.src);
+      };
+      img.onerror = () => reject(new Error("image illisible"));
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
   // Génère un code lisible à partir d'un nom (ex "Caisse Araven 20L" -> "GL-CAISSEARAVEN20L")
   function slugCode(nom) {
     const base = (nom || "")
@@ -1206,6 +1226,15 @@ Total : ${eur(total)} HT`;
           <button class="btn sec block" style="margin-top:12px" onclick="location.hash='#/journal/${tid}'">📜 Journal du parc</button>
         ` : ""}
 
+        ${!isNew ? `
+          <div class="section-title">Photo</div>
+          <div class="card">
+            <div id="photo-wrap">${t.photo_url ? `<img src="${esc(t.photo_url)}" alt="photo" style="width:100%;border-radius:12px;display:block" />` : `<div class="sub" style="text-align:center;padding:16px">Aucune photo</div>`}</div>
+            <input id="photo-file" type="file" accept="image/*" style="display:none" />
+            <button class="btn sec block" id="photo-btn" style="margin-top:8px">📷 ${t.photo_url ? "Changer la photo" : "Ajouter une photo"}</button>
+            ${t.photo_url ? `<button class="btn ghost block" id="photo-del" style="color:var(--danger)">Supprimer la photo</button>` : ""}
+          </div>` : `<div class="sub" style="margin-top:8px">📷 Enregistre d'abord le matériel pour pouvoir ajouter une photo.</div>`}
+
         ${!isNew && t.code_qr ? `
           <div class="card" style="text-align:center;margin-top:12px">
             <div id="qr-preview" style="display:flex;justify-content:center;margin:6px 0"></div>
@@ -1226,6 +1255,37 @@ Total : ${eur(total)} HT`;
     if (prev && t.code_qr) new QRCode(prev, { text: t.code_qr, width: 130, height: 130, correctLevel: QRCode.CorrectLevel.M });
 
     $("#gen-code").onclick = () => { $("#t-code").value = slugCode($("#t-nom").value); };
+
+    // --- Photo du matériel ---
+    const photoBtn = $("#photo-btn"), photoFile = $("#photo-file");
+    if (photoBtn && photoFile) {
+      photoBtn.onclick = () => photoFile.click();
+      photoFile.onchange = async () => {
+        const file = photoFile.files && photoFile.files[0];
+        if (!file) return;
+        photoBtn.disabled = true; photoBtn.textContent = "⏳ Envoi de la photo…";
+        try {
+          const blob = await resizeImage(file);
+          const path = `${tid}/${Date.now()}.jpg`;
+          const up = await sb.storage.from("materiel-photos").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+          if (up.error) throw up.error;
+          const { data: pub } = sb.storage.from("materiel-photos").getPublicUrl(path);
+          const url = pub.publicUrl;
+          const { error } = await sb.from("materiel_types").update({ photo_url: url }).eq("id", tid);
+          if (error) throw error;
+          toast("Photo enregistrée ✔", "ok"); render();
+        } catch (e) {
+          photoBtn.disabled = false; photoBtn.textContent = "📷 Réessayer";
+          toast("Photo : " + (e.message || e), "err");
+        }
+      };
+    }
+    const photoDel = $("#photo-del");
+    if (photoDel) photoDel.onclick = async () => {
+      const { error } = await sb.from("materiel_types").update({ photo_url: null }).eq("id", tid);
+      toast(error ? error.message : "Photo retirée ✔", error ? "err" : "ok");
+      if (!error) render();
+    };
 
     $("#save").onclick = async () => {
       const nom = $("#t-nom").value.trim();
@@ -1448,6 +1508,8 @@ Total : ${eur(total)} HT`;
               ${c.categorie ? `<div class="sub">🏷️ ${esc(c.categorie)}${c.groupe ? " · " + esc(c.groupe) : ""}</div>` : ""}
               ${c.adresse ? `<div class="sub">📍 ${esc(c.adresse)}</div>` : ""}
               ${c.adresse_livraison ? `<div class="sub">🚚 Livraison : ${esc(c.adresse_livraison)}</div>` : ""}
+              ${c.contact_livraison ? `<div class="sub">📞 Contact livraison : ${esc(c.contact_livraison)}</div>` : ""}
+              ${c.acces ? `<div class="sub">🔑 Accès : ${esc(c.acces)}</div>` : ""}
               <div class="sub">${c.contact ? esc(c.contact) : ""}${c.email ? " · " + esc(c.email) : ""}${c.telephone ? " · " + esc(c.telephone) : ""}</div>
             </div>
             ${clientBadge(c.type_client)}
@@ -1585,6 +1647,8 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
           </select>
           <label>Adresse (siège / facturation)</label><input id="c-adr" value="${esc(c.adresse || "")}" placeholder="Adresse principale" />
           <label>Adresse de livraison</label><input id="c-adrliv" value="${esc(c.adresse_livraison || "")}" placeholder="Si différente de l'adresse principale" />
+          <label>Contact livraison</label><input id="c-contactliv" value="${esc(c.contact_livraison || "")}" placeholder="Nom + tél de la personne sur place" />
+          <label>Accès</label><input id="c-acces" value="${esc(c.acces || "")}" placeholder="Digicode, étage, quai, consignes…" />
           <label>Contact</label><input id="c-contact" value="${esc(c.contact || "")}" placeholder="Personne / service" />
           <div class="field-row">
             <div><label>Email</label><input id="c-email" type="email" value="${esc(c.email || "")}" placeholder="pour le récap" /></div>
@@ -1615,6 +1679,8 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         type_client: $("#c-type").value,
         adresse: $("#c-adr").value.trim() || null,
         adresse_livraison: $("#c-adrliv").value.trim() || null,
+        contact_livraison: $("#c-contactliv").value.trim() || null,
+        acces: $("#c-acces").value.trim() || null,
         contact: $("#c-contact").value.trim() || null,
         email: $("#c-email").value.trim() || null,
         telephone: $("#c-tel").value.trim() || null,
