@@ -395,6 +395,30 @@
       <a href="#/prestation/${id}/sortie" style="color:var(--muted)">Revoir la sortie</a>
       ${!fixe ? ` · <a href="#/prestation/${id}/recuperation" style="color:var(--muted)">Récupération</a>` : ` · <a href="#/prestation/${id}/retour" style="color:var(--muted)">Récupération</a>`}
     </div>`);
+
+    // Suppression de la prestation — réservé aux admins
+    if (isAdmin()) {
+      const del = document.createElement("button");
+      del.className = "btn ghost block";
+      del.style.cssText = "color:var(--danger);margin-top:24px";
+      del.textContent = "🗑 Supprimer la prestation";
+      app.querySelector("main").appendChild(del);
+      let armed = false;
+      del.onclick = async () => {
+        if (!armed) {
+          armed = true;
+          del.textContent = "Confirmer ? (supprime aussi ses mouvements et facturations)";
+          del.classList.remove("ghost"); del.classList.add("danger");
+          setTimeout(() => { if (!armed) return; armed = false; del.textContent = "🗑 Supprimer la prestation"; del.classList.add("ghost"); del.classList.remove("danger"); }, 4500);
+          return;
+        }
+        del.disabled = true;
+        const { error } = await sb.from("prestations").delete().eq("id", id);
+        if (error) { del.disabled = false; return toast(error.message, "err"); }
+        toast("Prestation supprimée ✔", "ok");
+        go("prestations");
+      };
+    }
   }
 
   // =========================================================================
