@@ -1092,7 +1092,9 @@ Total : ${eur(total)} HT`;
       app.innerHTML = topbar("Admin") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
       return;
     }
-    const [users, compta] = await Promise.all([db.usersList(), db.param("email_compta")]);
+    const [users, compta, recapEmails, recapFreq] = await Promise.all([db.usersList(), db.param("email_compta"), db.param("recap_emails"), db.param("recap_frequence")]);
+    const freq = recapFreq || "1_15";
+    const freqOpts = [["1_15", "Le 1ᵉʳ et le 15 du mois"], ["1", "Le 1ᵉʳ du mois"], ["15", "Le 15 du mois"], ["hebdo", "Chaque lundi"], ["off", "Désactivé (aucun envoi)"]];
     app.innerHTML =
       topbar("Espace admin") +
       `<main>
@@ -1108,6 +1110,19 @@ Total : ${eur(total)} HT`;
           <input id="a-compta" type="email" value="${esc(compta)}" placeholder="compta@briffe.me" />
           <button class="btn block" id="a-compta-save" style="margin-top:8px">Enregistrer</button>
         </div>
+
+        <div class="section-title">Récap contenants détenus</div>
+        <div class="card">
+          <div class="sub" style="margin-bottom:8px">Récap automatique par mail des contenants détenus par <b>tous les clients</b> (fixes et ponctuels, pour repérer les commandes non récupérées).</div>
+          <label>Fréquence d'envoi</label>
+          <select id="a-recap-freq">
+            ${freqOpts.map(([v, lib]) => `<option value="${v}" ${freq === v ? "selected" : ""}>${lib}</option>`).join("")}
+          </select>
+          <label style="margin-top:12px">Destinataires (une adresse par ligne)</label>
+          <textarea id="a-recap" rows="3" placeholder="antoine@briffe.me">${esc((recapEmails || "").split(/[,;\n]/).map((s) => s.trim()).filter(Boolean).join("\n"))}</textarea>
+          <div class="sub" style="margin-top:4px">Chaque adresse doit exister dans les contacts Briffe. Envoi vers 8h (heure de Paris).</div>
+          <button class="btn block" id="a-recap-save" style="margin-top:8px">Enregistrer les réglages du récap</button>
+        </div>
       </main>`;
     $$(".role-toggle").forEach((b) => b.onclick = async () => {
       const newRole = b.dataset.role === "admin" ? "livreur" : "admin";
@@ -1120,6 +1135,13 @@ Total : ${eur(total)} HT`;
     $("#a-compta-save").onclick = async () => {
       const { error } = await db.setParam("email_compta", $("#a-compta").value.trim());
       toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
+    };
+    $("#a-recap-save").onclick = async () => {
+      const list = $("#a-recap").value.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean).join(",");
+      const f = $("#a-recap-freq").value;
+      const [r1, r2] = await Promise.all([db.setParam("recap_emails", list), db.setParam("recap_frequence", f)]);
+      const err = (r1 && r1.error) || (r2 && r2.error);
+      toast(err ? err.message : "Réglages du récap enregistrés ✔", err ? "err" : "ok");
     };
   }
 
