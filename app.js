@@ -1230,9 +1230,13 @@ Total : ${eur(total)} HT`;
           <div class="section-title">Photo</div>
           <div class="card">
             <div id="photo-wrap">${t.photo_url ? `<img src="${esc(t.photo_url)}" alt="photo" style="width:100%;border-radius:12px;display:block" />` : `<div class="sub" style="text-align:center;padding:16px">Aucune photo</div>`}</div>
-            <input id="photo-file" type="file" accept="image/*" style="display:none" />
-            <button class="btn sec block" id="photo-btn" style="margin-top:8px">📷 ${t.photo_url ? "Changer la photo" : "Ajouter une photo"}</button>
-            ${t.photo_url ? `<button class="btn ghost block" id="photo-del" style="color:var(--danger)">Supprimer la photo</button>` : ""}
+            <input id="photo-cam" type="file" accept="image/*" capture="environment" style="display:none" />
+            <input id="photo-gal" type="file" accept="image/*" style="display:none" />
+            <div class="btn-grid" style="margin-top:8px">
+              <button class="btn sec" id="photo-cam-btn">📷 Prendre une photo</button>
+              <button class="btn sec" id="photo-gal-btn">🖼️ Galerie</button>
+            </div>
+            ${t.photo_url ? `<button class="btn ghost block" id="photo-del" style="color:var(--danger);margin-top:8px">Supprimer la photo</button>` : ""}
           </div>` : `<div class="sub" style="margin-top:8px">📷 Enregistre d'abord le matériel pour pouvoir ajouter une photo.</div>`}
 
         ${!isNew && t.code_qr ? `
@@ -1256,29 +1260,36 @@ Total : ${eur(total)} HT`;
 
     $("#gen-code").onclick = () => { $("#t-code").value = slugCode($("#t-nom").value); };
 
-    // --- Photo du matériel ---
-    const photoBtn = $("#photo-btn"), photoFile = $("#photo-file");
-    if (photoBtn && photoFile) {
-      photoBtn.onclick = () => photoFile.click();
-      photoFile.onchange = async () => {
-        const file = photoFile.files && photoFile.files[0];
-        if (!file) return;
-        photoBtn.disabled = true; photoBtn.textContent = "⏳ Envoi de la photo…";
-        try {
-          const blob = await resizeImage(file);
-          const path = `${tid}/${Date.now()}.jpg`;
-          const up = await sb.storage.from("materiel-photos").upload(path, blob, { contentType: "image/jpeg", upsert: true });
-          if (up.error) throw up.error;
-          const { data: pub } = sb.storage.from("materiel-photos").getPublicUrl(path);
-          const url = pub.publicUrl;
-          const { error } = await sb.from("materiel_types").update({ photo_url: url }).eq("id", tid);
-          if (error) throw error;
-          toast("Photo enregistrée ✔", "ok"); render();
-        } catch (e) {
-          photoBtn.disabled = false; photoBtn.textContent = "📷 Réessayer";
-          toast("Photo : " + (e.message || e), "err");
-        }
-      };
+    // --- Photo du matériel (appareil photo ou galerie) ---
+    const photoCamBtn = $("#photo-cam-btn"), photoGalBtn = $("#photo-gal-btn");
+    const photoCam = $("#photo-cam"), photoGal = $("#photo-gal");
+    async function uploadPhoto(file) {
+      if (!file) return;
+      const btns = [photoCamBtn, photoGalBtn].filter(Boolean);
+      btns.forEach((b) => (b.disabled = true));
+      if (photoCamBtn) photoCamBtn.textContent = "⏳ Envoi de la photo…";
+      try {
+        const blob = await resizeImage(file);
+        const path = `${tid}/${Date.now()}.jpg`;
+        const up = await sb.storage.from("materiel-photos").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+        if (up.error) throw up.error;
+        const { data: pub } = sb.storage.from("materiel-photos").getPublicUrl(path);
+        const { error } = await sb.from("materiel_types").update({ photo_url: pub.publicUrl }).eq("id", tid);
+        if (error) throw error;
+        toast("Photo enregistrée ✔", "ok"); render();
+      } catch (e) {
+        btns.forEach((b) => (b.disabled = false));
+        if (photoCamBtn) photoCamBtn.textContent = "📷 Réessayer";
+        toast("Photo : " + (e.message || e), "err");
+      }
+    }
+    if (photoCamBtn && photoCam) {
+      photoCamBtn.onclick = () => photoCam.click();
+      photoCam.onchange = () => uploadPhoto(photoCam.files && photoCam.files[0]);
+    }
+    if (photoGalBtn && photoGal) {
+      photoGalBtn.onclick = () => photoGal.click();
+      photoGal.onchange = () => uploadPhoto(photoGal.files && photoGal.files[0]);
     }
     const photoDel = $("#photo-del");
     if (photoDel) photoDel.onclick = async () => {
