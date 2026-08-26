@@ -217,6 +217,61 @@
     return `<span class="badge ${cls}">${esc(STATUT_LABEL[s] || s)}</span>`;
   };
 
+  // Normalisation pour recherche (sans accents ni casse)
+  function _norm(s) { return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
+
+  // Sélecteur de client réutilisable : recherche par nom + filtre Fixe/Ponctuel.
+  // Écrit l'id choisi dans un input caché #f-client (compatible avec le code existant).
+  function clientPickerHtml(clients, selectedId) {
+    const sel = clients.find((c) => c.id === selectedId);
+    return `
+      <div class="picker" style="position:relative">
+        <input type="hidden" id="f-client" value="${selectedId || ""}" />
+        <input id="cli-search" autocomplete="off" placeholder="Taper le nom du client…" value="${sel ? esc(sel.nom) : ""}" />
+        <div class="seg" id="cli-typeseg" style="margin-top:6px">
+          <button type="button" data-t="" class="active">Tous</button>
+          <button type="button" data-t="fixe">Fixes</button>
+          <button type="button" data-t="ponctuel">Ponctuels</button>
+        </div>
+        <div id="cli-results" class="hidden" style="border:1px solid var(--line);border-radius:11px;margin-top:6px;max-height:260px;overflow:auto;background:#fff"></div>
+      </div>`;
+  }
+  function clientPickerWire(clients) {
+    const search = $("#cli-search"), results = $("#cli-results"), hidden = $("#f-client"), seg = $("#cli-typeseg");
+    if (!search) return;
+    let typeFilter = "";
+    const rowStyle = "display:flex;align-items:center;gap:10px;padding:11px 12px;border-bottom:1px solid var(--line);cursor:pointer";
+    const render = () => {
+      const q = _norm(search.value.trim());
+      let list = clients.filter((c) => !typeFilter || c.type_client === typeFilter);
+      if (q) list = list.filter((c) => _norm(c.nom).includes(q) || _norm(c.categorie).includes(q) || _norm(c.groupe).includes(q));
+      const total = list.length;
+      list = list.slice(0, 60);
+      results.innerHTML = total
+        ? list.map((c) => `<div class="picker-row" data-id="${c.id}" style="${rowStyle}">
+             <div class="grow"><b>${esc(c.nom)}</b>${c.categorie ? `<small style="color:var(--muted)"> · ${esc(c.categorie)}</small>` : ""}</div>
+             <span class="badge ${c.type_client === "fixe" ? "green" : "gray"}">${c.type_client === "fixe" ? "Fixe" : "Ponctuel"}</span>
+           </div>`).join("") + (total > 60 ? `<div style="padding:10px 12px;color:var(--muted);font-size:13px">… affine ta recherche (${total} résultats)</div>` : "")
+        : `<div style="padding:12px;color:var(--muted)">Aucun client trouvé</div>`;
+      results.classList.remove("hidden");
+    };
+    search.onfocus = render;
+    search.oninput = () => { hidden.value = ""; render(); };
+    search.onblur = () => setTimeout(() => results.classList.add("hidden"), 200);
+    seg.onmousedown = (e) => e.preventDefault(); // garder le focus sur la recherche
+    seg.querySelectorAll("button").forEach((b) => b.onclick = () => {
+      seg.querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active"); typeFilter = b.dataset.t;
+      render();
+    });
+    results.onmousedown = (e) => {
+      const row = e.target.closest(".picker-row[data-id]"); if (!row) return;
+      e.preventDefault(); // empêche le blur avant la sélection
+      const c = clients.find((x) => x.id === row.dataset.id); if (!c) return;
+      hidden.value = c.id; search.value = c.nom; results.classList.add("hidden");
+    };
+  }
+
   // =========================================================================
   //  VUE : Liste des prestations
   // =========================================================================
@@ -291,10 +346,7 @@
           <label>Libellé</label>
           <input id="f-lib" placeholder="Ex : Cocktail 120p – Mairie de Lille" />
           <label>Client</label>
-          <select id="f-client">
-            <option value="">— Choisir —</option>
-            ${clients.map((c) => `<option value="${c.id}">${esc(c.nom)}</option>`).join("")}
-          </select>
+          ${clientPickerHtml(clients, "")}
           <div class="field-row">
             <div><label>Date de livraison</label><input id="f-date" type="date" value="${new Date().toISOString().slice(0,10)}" /></div>
             <div><label>Numéro</label><input id="f-ref" placeholder="N° dossier" /></div>
@@ -304,6 +356,7 @@
           <button class="btn block" id="save">Créer la prestation</button>
         </div>
       </main>`;
+    clientPickerWire(clients);
     $("#save").onclick = async () => {
       const lib = $("#f-lib").value.trim();
       if (!lib) return toast("Ajoute un libellé", "err");
@@ -341,10 +394,7 @@
           <label>Libellé</label>
           <input id="f-lib" value="${esc(p.libelle || "")}" placeholder="Libellé" />
           <label>Client</label>
-          <select id="f-client">
-            <option value="">— Choisir —</option>
-            ${clients.map((c) => `<option value="${c.id}" ${p.client_id === c.id ? "selected" : ""}>${esc(c.nom)}</option>`).join("")}
-          </select>
+          ${clientPickerHtml(clients, p.client_id)}
           <div class="field-row">
             <div><label>Date de livraison</label><input id="f-date" type="date" value="${p.date_presta ? String(p.date_presta).slice(0,10) : ""}" /></div>
             <div><label>Numéro</label><input id="f-ref" value="${esc(p.reference || "")}" placeholder="N° dossier" /></div>
@@ -359,6 +409,7 @@
         </div>
         <div class="card"><div class="sub">Modifier le client ou la date ne change pas les mouvements de matériel déjà enregistrés. Pour corriger les quantités sorties/récupérées, utilise « Revoir la sortie » / « Récupération » sur la fiche.</div></div>
       </main>`;
+    clientPickerWire(clients);
     $("#save").onclick = async () => {
       const lib = $("#f-lib").value.trim();
       if (!lib) return toast("Ajoute un libellé", "err");
