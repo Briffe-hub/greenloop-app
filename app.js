@@ -157,6 +157,7 @@
         if (sub === "retour") return viewFlux(id, "retour");
         if (sub === "recuperation") return viewRecuperation(id);
         if (sub === "manquants") return viewManquants(id);
+        if (sub === "edit") return viewPrestaEdit(id);
         return viewPrestationDetail(id);
       }
       if (head === "nouvelle-presta") return viewPrestaForm();
@@ -325,6 +326,58 @@
   }
 
   // =========================================================================
+  //  VUE : Modifier une prestation (admin) — client, date, statut, etc.
+  // =========================================================================
+  async function viewPrestaEdit(id) {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Modifier") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const [p, clients] = await Promise.all([db.prestation(id), db.clients()]);
+    app.innerHTML =
+      topbar("Modifier la prestation", { back: "prestation/" + id }) +
+      `<main>
+        <div class="card">
+          <label>Libellé</label>
+          <input id="f-lib" value="${esc(p.libelle || "")}" placeholder="Libellé" />
+          <label>Client</label>
+          <select id="f-client">
+            <option value="">— Choisir —</option>
+            ${clients.map((c) => `<option value="${c.id}" ${p.client_id === c.id ? "selected" : ""}>${esc(c.nom)}</option>`).join("")}
+          </select>
+          <div class="field-row">
+            <div><label>Date de livraison</label><input id="f-date" type="date" value="${p.date_presta ? String(p.date_presta).slice(0,10) : ""}" /></div>
+            <div><label>Numéro</label><input id="f-ref" value="${esc(p.reference || "")}" placeholder="N° dossier" /></div>
+          </div>
+          <label>Statut</label>
+          <select id="f-statut">
+            ${Object.keys(STATUT_LABEL).map((s) => `<option value="${s}" ${p.statut === s ? "selected" : ""}>${esc(STATUT_LABEL[s])}</option>`).join("")}
+          </select>
+          <label>Notes</label>
+          <textarea id="f-notes" placeholder="Infos utiles…">${esc(p.notes || "")}</textarea>
+          <button class="btn block" id="save">Enregistrer les modifications</button>
+        </div>
+        <div class="card"><div class="sub">Modifier le client ou la date ne change pas les mouvements de matériel déjà enregistrés. Pour corriger les quantités sorties/récupérées, utilise « Revoir la sortie » / « Récupération » sur la fiche.</div></div>
+      </main>`;
+    $("#save").onclick = async () => {
+      const lib = $("#f-lib").value.trim();
+      if (!lib) return toast("Ajoute un libellé", "err");
+      $("#save").disabled = true;
+      const { error } = await sb.from("prestations").update({
+        libelle: lib,
+        client_id: $("#f-client").value || null,
+        date_presta: $("#f-date").value || null,
+        reference: $("#f-ref").value.trim() || null,
+        statut: $("#f-statut").value,
+        notes: $("#f-notes").value.trim() || null,
+      }).eq("id", id);
+      $("#save").disabled = false;
+      toast(error ? error.message : "Prestation modifiée ✔", error ? "err" : "ok");
+      if (!error) go("prestation/" + id);
+    };
+  }
+
+  // =========================================================================
   //  VUE : Détail prestation
   // =========================================================================
   async function viewPrestationDetail(id) {
@@ -395,6 +448,16 @@
       <a href="#/prestation/${id}/sortie" style="color:var(--muted)">Revoir la sortie</a>
       ${!fixe ? ` · <a href="#/prestation/${id}/recuperation" style="color:var(--muted)">Récupération</a>` : ` · <a href="#/prestation/${id}/retour" style="color:var(--muted)">Récupération</a>`}
     </div>`);
+
+    // Modification de la prestation — réservé aux admins
+    if (isAdmin()) {
+      const edit = document.createElement("button");
+      edit.className = "btn sec block";
+      edit.style.cssText = "margin-top:24px";
+      edit.textContent = "✏️ Modifier la prestation (admin)";
+      edit.onclick = () => go("prestation/" + id + "/edit");
+      app.querySelector("main").appendChild(edit);
+    }
 
     // Suppression de la prestation — réservé aux admins
     if (isAdmin()) {
@@ -1539,6 +1602,7 @@ Total : ${eur(total)} HT`;
           <div class="row between">
             <div class="grow">
               ${c.categorie ? `<div class="sub">🏷️ ${esc(c.categorie)}${c.groupe ? " · " + esc(c.groupe) : ""}</div>` : ""}
+              ${c.titulaire ? `<div class="sub">📄 Titulaire du contrat : <b>${esc(c.titulaire)}</b></div>` : ""}
               ${c.adresse ? `<div class="sub">📍 ${esc(c.adresse)}</div>` : ""}
               ${c.adresse_livraison ? `<div class="sub">🚚 Livraison : ${esc(c.adresse_livraison)}</div>` : ""}
               ${c.contact_livraison ? `<div class="sub">📞 Contact livraison : ${esc(c.contact_livraison)}</div>` : ""}
@@ -1691,6 +1755,9 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
             <div><label>Catégorie</label><input id="c-cat" list="cat-list" value="${esc(c.categorie || "")}" placeholder="ex. Appels d'offre" /></div>
             <div><label>Groupe</label><input id="c-groupe" value="${esc(c.groupe || "")}" placeholder="ex. UnivLille" /></div>
           </div>
+          <label>Titulaire du contrat (appel d'offre)</label>
+          <input id="c-titulaire" list="titulaire-list" value="${esc(c.titulaire || "")}" placeholder="Qui détient le contrat : Briffe, La consignerie…" />
+          <datalist id="titulaire-list"><option value="Briffe"></option><option value="La consignerie"></option></datalist>
           <datalist id="cat-list"></datalist>
           <label>ID Sextan (optionnel)</label><input id="c-sextan" value="${esc(c.sextan_id || "")}" />
           <button class="btn block" id="save">${isNew ? "Créer" : "Enregistrer"}</button>
@@ -1719,6 +1786,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         telephone: $("#c-tel").value.trim() || null,
         categorie: $("#c-cat").value.trim() || null,
         groupe: $("#c-groupe").value.trim() || null,
+        titulaire: $("#c-titulaire").value.trim() || null,
         sextan_id: $("#c-sextan").value.trim() || null,
       };
       $("#save").disabled = true;
