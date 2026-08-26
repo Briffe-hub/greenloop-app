@@ -296,7 +296,7 @@
             <h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>
             ${prestaBadge(p.statut)}
           </div>
-          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}</div>
+          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}${p.source === "sextan" ? ` · <span class="badge blue" style="font-size:10px;padding:1px 6px">Sextan</span>` : ""}</div>
         </div>
         <div style="font-size:22px;color:#cbd5c9">›</div>
       </div>`;
@@ -310,16 +310,29 @@
           <button data-f="ponctuel">Ponctuels (${counts.ponctuel})</button>
           <button data-f="ao">Appels d'offre (${counts.ao})</button>
         </div>
+        <div class="row between" style="margin:2px 2px 10px">
+          <div class="sub">Triées par date de livraison</div>
+          <button class="btn sm sec" id="psort" style="width:auto">📅 Plus proches d'abord ↑</button>
+        </div>
         <div id="plist"></div>
       </main>
       <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
 
     let f = "tout";
+    let sortAsc = true; // true = date croissante (les plus proches / à venir d'abord)
+    const byDate = (a, b) => {
+      const da = a.date_presta || "", db2 = b.date_presta || "";
+      if (!da && !db2) return 0;
+      if (!da) return 1;            // sans date -> à la fin
+      if (!db2) return -1;
+      return (da < db2 ? -1 : da > db2 ? 1 : 0) * (sortAsc ? 1 : -1);
+    };
     const draw = () => {
       let l = list;
       if (f === "fixe") l = list.filter((p) => typeOf(p) === "fixe");
       else if (f === "ponctuel") l = list.filter((p) => typeOf(p) === "ponctuel");
       else if (f === "ao") l = list.filter(isAO);
+      l = l.slice().sort(byDate);
       $("#plist").innerHTML = l.length
         ? l.map(card).join("")
         : `<div class="empty"><div class="big">📋</div>Aucune prestation.</div>`;
@@ -331,6 +344,11 @@
       $$("#pfilter button").forEach((x) => x.classList.toggle("active", x === b));
       draw();
     });
+    $("#psort").onclick = () => {
+      sortAsc = !sortAsc;
+      $("#psort").textContent = sortAsc ? "📅 Plus proches d'abord ↑" : "📅 Plus lointaines d'abord ↓";
+      draw();
+    };
     draw();
   }
 
@@ -1206,7 +1224,10 @@ Total : ${eur(total)} HT`;
       app.innerHTML = topbar("Admin") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
       return;
     }
-    const [users, compta, recapEmails, recapFreq] = await Promise.all([db.usersList(), db.param("email_compta"), db.param("recap_emails"), db.param("recap_frequence")]);
+    const [users, compta, recapEmails, recapFreq, aValider] = await Promise.all([
+      db.usersList(), db.param("email_compta"), db.param("recap_emails"), db.param("recap_frequence"),
+      db.q("clients", (q) => q.eq("sextan_auto", true).order("nom")),
+    ]);
     const freq = recapFreq || "1_15";
     const freqOpts = [["1_15", "Le 1ᵉʳ et le 15 du mois"], ["1", "Le 1ᵉʳ du mois"], ["15", "Le 15 du mois"], ["hebdo", "Chaque lundi"], ["off", "Désactivé (aucun envoi)"]];
     app.innerHTML =
@@ -1218,6 +1239,16 @@ Total : ${eur(total)} HT`;
             <div class="grow"><b>${esc(u.nom || "—")}</b><div class="sub">${u.role === "admin" ? "👑 Administrateur" : "Livreur"}</div></div>
             <button class="btn sm ${u.role === "admin" ? "ghost" : "sec"} role-toggle" data-id="${u.id}" data-role="${u.role}" style="flex:0 0 auto">${u.role === "admin" ? "Rétrograder" : "Passer admin"}</button>
           </div></div>`).join("")}
+        <div class="section-title">Clients importés de Sextan à valider${aValider.length ? ` (${aValider.length})` : ""}</div>
+        ${aValider.length ? aValider.map((c) => `
+          <div class="card"><div class="row between">
+            <div class="grow"><b>${esc(c.nom)}</b><div class="sub">Créé automatiquement · ${c.type_client === "fixe" ? "Fixe" : "Ponctuel"} par défaut${c.email ? " · " + esc(c.email) : ""}</div></div>
+          </div>
+          <div class="btn-grid" style="margin-top:8px">
+            <button class="btn sec" onclick="location.hash='#/client/${c.id}/edit'">Régler la fiche</button>
+            <button class="btn ghost valider-cli" data-id="${c.id}">Valider tel quel</button>
+          </div></div>`).join("") : `<div class="card"><div class="sub">Aucun client en attente. Les prestations Sextan sont importées automatiquement chaque heure ; un nouveau client apparaît ici pour que tu règles son type (fixe/ponctuel) et ses adresses.</div></div>`}
+
         <div class="section-title">Facturation</div>
         <div class="card">
           <label>Email du service comptabilité</label>
@@ -1245,6 +1276,12 @@ Total : ${eur(total)} HT`;
       const { error } = await sb.from("profiles").update({ role: newRole }).eq("id", b.dataset.id);
       if (error) return toast(error.message, "err");
       toast("Rôle mis à jour ✔", "ok"); render();
+    });
+    $$(".valider-cli").forEach((b) => b.onclick = async () => {
+      b.disabled = true;
+      const { error } = await sb.from("clients").update({ sextan_auto: false }).eq("id", b.dataset.id);
+      if (error) { b.disabled = false; return toast(error.message, "err"); }
+      toast("Client validé ✔", "ok"); render();
     });
     $("#a-compta-save").onclick = async () => {
       const { error } = await db.setParam("email_compta", $("#a-compta").value.trim());
@@ -1839,6 +1876,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         groupe: $("#c-groupe").value.trim() || null,
         titulaire: $("#c-titulaire").value.trim() || null,
         sextan_id: $("#c-sextan").value.trim() || null,
+        sextan_auto: false, // enregistrer une fiche = validée (sort de la liste « à valider »)
       };
       $("#save").disabled = true;
       if (isNew) {
