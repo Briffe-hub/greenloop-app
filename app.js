@@ -206,6 +206,7 @@
   }
   const STATUT_LABEL = {
     en_cours: "En préparation",
+    a_quai: "À quai – prêt à livrer",
     en_livraison: "En cours de livraison",
     a_recuperer: "Livré – à récupérer",
     recupere: "Récupéré",
@@ -213,7 +214,7 @@
     clos: "Clos",
   };
   const prestaBadge = (s) => {
-    const cls = { en_cours: "gray", en_livraison: "blue", a_recuperer: "amber", recupere: "green", livre: "green", clos: "gray" }[s] || "gray";
+    const cls = { en_cours: "gray", a_quai: "blue", en_livraison: "amber", a_recuperer: "amber", recupere: "green", livre: "green", clos: "gray" }[s] || "gray";
     return `<span class="badge ${cls}">${esc(STATUT_LABEL[s] || s)}</span>`;
   };
 
@@ -485,26 +486,32 @@
     const bigBtn = (label, sub, cls, onclick) =>
       `<button class="btn ${cls} block" style="padding:18px" onclick="${onclick}">${label}<br><small style="font-weight:500">${sub}</small></button>`;
 
+    const setStatut = async (st, okMsg) => {
+      const { error } = await sb.from("prestations").update({ statut: st }).eq("id", id);
+      if (error) return toast(error.message, "err");
+      toast(okMsg, "ok"); render();
+    };
+
     if (p.statut === "en_cours") {
-      wf.innerHTML = bigBtn("📤 Valider la sortie (quai)", "Enregistre le matériel chargé au départ", "",
+      wf.innerHTML = bigBtn("📦 Préparer la sortie (quai)", "Charge et pointe le matériel au départ", "",
         `location.hash='#/prestation/${id}/sortie'`);
+    } else if (p.statut === "a_quai") {
+      wf.innerHTML =
+        `<div class="card" style="text-align:center"><div style="font-size:30px">🚏</div><b>${totalSortie} pièce(s) à quai, prêtes à partir.</b>
+          <div class="sub" style="margin-top:4px">Le matériel est chargé. Valide le départ quand le camion part.</div></div>` +
+        `<button class="btn block" id="wf-depart" style="padding:18px">🚚 Valider le départ<br><small style="font-weight:500">La prestation passe « en cours de livraison »</small></button>`;
+      $("#wf-depart").onclick = () => setStatut("en_livraison", "Départ validé ✔");
     } else if (p.statut === "en_livraison") {
-      if (fixe) {
-        wf.innerHTML = bigBtn("✅ Valider livraison + récupération", "Ce qui est repris est enregistré en même temps", "",
-          `location.hash='#/prestation/${id}/retour'`);
-      } else {
-        wf.innerHTML =
-          `<div class="card"><div class="sub">Matériel chargé, en route vers le client.</div></div>` +
-          `<button class="btn block" id="wf-livre" style="padding:18px">✅ Confirmer la livraison<br><small style="font-weight:500">Le matériel est déposé chez le client</small></button>`;
-        $("#wf-livre").onclick = async () => {
-          const { error } = await sb.from("prestations").update({ statut: "a_recuperer" }).eq("id", id);
-          if (error) return toast(error.message, "err");
-          toast("Livraison confirmée ✔", "ok"); render();
-        };
-      }
+      wf.innerHTML =
+        `<div class="card"><div class="sub">🚚 En route vers le client (${totalSortie} pièce(s)).</div></div>` +
+        `<button class="btn block" id="wf-livre" style="padding:18px">✅ Confirmer la livraison<br><small style="font-weight:500">Le matériel est déposé chez le client</small></button>`;
+      $("#wf-livre").onclick = () => setStatut("a_recuperer", "Livraison confirmée ✔");
     } else if (p.statut === "a_recuperer") {
-      wf.innerHTML = bigBtn("📥 Récupérer le matériel", "Pointe le matériel repris chez le client", "",
-        `location.hash='#/prestation/${id}/recuperation'`);
+      wf.innerHTML = fixe
+        ? bigBtn("📥 Récupérer (livraison client fixe)", "Pointe ce qui est repris ; le reste continue chez le client", "",
+            `location.hash='#/prestation/${id}/retour'`)
+        : bigBtn("📥 Récupérer le matériel", "Pointe le matériel repris chez le client", "",
+            `location.hash='#/prestation/${id}/recuperation'`);
     } else if (p.statut === "recupere" || p.statut === "livre") {
       wf.innerHTML =
         `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div><b>Prestation ${STATUT_LABEL[p.statut].toLowerCase()}.</b>
@@ -562,9 +569,23 @@
     const label = sens === "sortie" ? "Sortie" : "Retour";
     const verb = sens === "sortie" ? "livrés" : "récupérés";
 
+    // Précharge les quantités déjà enregistrées pour ce sens (permet de revoir / corriger / annuler).
+    const [mvtRes, factRes] = await Promise.all([
+      sb.from("mouvements").select("type_id,quantite").eq("prestation_id", id).eq("sens", sens),
+      sens === "retour"
+        ? sb.from("facturations").select("type_id,motif,quantite").eq("prestation_id", id).eq("statut", "a_facturer").in("motif", ["casse", "perte"])
+        : Promise.resolve({ data: [] }),
+    ]);
+    const cpByType = {}; // casses/pertes déjà déclarées (retour)
+    (factRes.data || []).forEach((f) => (cpByType[f.type_id] = (cpByType[f.type_id] || 0) + f.quantite));
+    const existingCP = (factRes.data || []).slice();
+
     // Modèle « un QR par type » : chaque scan incrémente la quantité du type.
     const counts = {};
     types.forEach((t) => (counts[t.id] = 0));
+    (mvtRes.data || []).forEach((m) => (counts[m.type_id] = (counts[m.type_id] || 0) + m.quantite));
+    // en retour, les casses/pertes ont été comptées comme "revenues" : on les retire de la saisie normale
+    if (sens === "retour") Object.keys(cpByType).forEach((tid) => (counts[tid] = Math.max(0, (counts[tid] || 0) - cpByType[tid])));
     const byCode = {};
     types.forEach((t) => { if (t.code_qr) byCode[t.code_qr.trim()] = t; });
 
@@ -582,7 +603,7 @@
         <div class="name"><b>${esc(t.nom)}</b><small>${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR — saisie manuelle"}</small></div>
         <div class="qty" data-type="${t.id}">
           <button data-d="-1">−</button>
-          <input type="number" inputmode="numeric" value="0" min="0" data-qtyinput="${t.id}" />
+          <input type="number" inputmode="numeric" value="${counts[t.id] || 0}" min="0" data-qtyinput="${t.id}" />
           <button data-d="1">＋</button>
         </div>
       </div>`;
@@ -627,7 +648,7 @@
     // --- déclaration des casses/pertes (retour uniquement) ---
     const cpAdd = $("#cp-add");
     if (cpAdd) {
-      const addRow = () => {
+      const addRow = (preset) => {
         const row = document.createElement("div");
         row.className = "cp-row";
         row.style.cssText = "border-top:1px solid var(--line);padding:10px 0";
@@ -642,9 +663,16 @@
             <button class="btn sm ghost cp-rm" style="flex:0 0 auto;color:var(--danger)">✕</button>
           </div>`;
         $("#cp-list").appendChild(row);
+        if (preset) {
+          row.querySelector(".cp-type").value = preset.type_id;
+          row.querySelector(".cp-motif").value = preset.motif;
+          row.querySelector(".cp-qty").value = preset.quantite;
+        }
         row.querySelector(".cp-rm").onclick = () => row.remove();
       };
-      cpAdd.onclick = addRow;
+      cpAdd.onclick = () => addRow();
+      // repré-remplit les casses/pertes déjà déclarées (revoir un retour)
+      existingCP.forEach((f) => addRow({ type_id: f.type_id, motif: f.motif, quantite: f.quantite }));
     }
 
     const updateRecap = () => {
@@ -701,13 +729,17 @@
     $("#manual-add").onclick = () => { addCode($("#manual-code").value); $("#manual-code").value = ""; };
     $("#manual-code").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#manual-add").click(); });
 
+    updateRecap(); // reflète les quantités déjà saisies au chargement
     startScanner(addCode);
 
     $("#valider").onclick = async () => {
       const rows = [];
+      let totalSaisi = 0;
       types.forEach((t) => {
-        if (counts[t.id] > 0)
+        if (counts[t.id] > 0) {
+          totalSaisi += counts[t.id];
           rows.push({ prestation_id: id, sens, type_id: t.id, unit_id: null, quantite: counts[t.id], par_user: state.user.id });
+        }
       });
 
       // casses & pertes déclarées (retour) -> facturations + règlement du solde
@@ -727,8 +759,16 @@
         rows.push({ prestation_id: id, sens: "retour", type_id: tid, unit_id: null, quantite: qte, par_user: state.user.id });
       });
 
-      if (!rows.length && !facts.length) return toast("Rien à valider", "err");
       $("#valider").disabled = true;
+
+      // REMPLACEMENT idempotent : on efface d'abord ce sens (permet de corriger / annuler),
+      // puis on réécrit à partir de la saisie courante.
+      const delMvt = await sb.from("mouvements").delete().eq("prestation_id", id).eq("sens", sens);
+      if (delMvt.error) { $("#valider").disabled = false; return toast(delMvt.error.message, "err"); }
+      if (sens === "retour") {
+        const delF = await sb.from("facturations").delete().eq("prestation_id", id).eq("statut", "a_facturer").in("motif", ["casse", "perte"]);
+        if (delF.error) { $("#valider").disabled = false; return toast(delF.error.message, "err"); }
+      }
       if (rows.length) {
         const { error } = await sb.from("mouvements").insert(rows);
         if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
@@ -737,11 +777,26 @@
         const { error } = await sb.from("facturations").insert(facts);
         if (error) { $("#valider").disabled = false; return toast("Retour ok mais facturation : " + error.message, "err"); }
       }
-      // avancement du statut de la prestation
-      const nextStatut = sens === "sortie" ? "en_livraison" : "livre"; // retour = livraison+récup d'un client fixe
+
+      // avancement du statut selon la saisie
+      let nextStatut;
+      if (sens === "sortie") {
+        // on ne fait avancer/reculer le statut QUE pendant la phase de préparation ;
+        // si la prestation est déjà partie/livrée, on corrige les quantités sans régresser le statut.
+        if (p.statut === "en_cours" || p.statut === "a_quai") {
+          nextStatut = totalSaisi > 0 ? "a_quai" : "en_cours"; // 0 = sortie annulée -> retour en préparation
+        } else {
+          nextStatut = p.statut;
+        }
+      } else {
+        nextStatut = (totalSaisi > 0 || facts.length) ? "recupere" : "a_recuperer";
+      }
       await sb.from("prestations").update({ statut: nextStatut }).eq("id", id);
       stopScanner();
-      toast(facts.length ? `${label} + ${facts.length} à facturer ✔` : label + " enregistrée ✔", "ok");
+      const msg = sens === "sortie"
+        ? (totalSaisi > 0 ? `Sortie enregistrée (${totalSaisi} pièce(s)) ✔` : "Sortie annulée ✔")
+        : (facts.length ? `Retour + ${facts.length} à facturer ✔` : "Retour enregistré ✔");
+      toast(msg, "ok");
       go("prestation/" + id);
     };
   }
