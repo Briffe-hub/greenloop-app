@@ -1494,12 +1494,26 @@ Total : ${eur(total)} HT`;
     app.innerHTML =
       topbar("Espace admin") +
       `<main>
-        <div class="section-title">Équipe</div>
+        <div class="section-title">Comptes (${users.length})</div>
         ${users.map((u) => `
-          <div class="card"><div class="row between">
-            <div class="grow"><b>${esc(u.nom || "—")}</b><div class="sub">${u.role === "admin" ? "👑 Administrateur" : "Livreur"}</div></div>
-            <button class="btn sm ${u.role === "admin" ? "ghost" : "sec"} role-toggle" data-id="${u.id}" data-role="${u.role}" style="flex:0 0 auto">${u.role === "admin" ? "Rétrograder" : "Passer admin"}</button>
-          </div></div>`).join("")}
+          <div class="card" data-uid="${u.id}">
+            <label style="margin-top:0">Nom${u.id === state.user.id ? " (toi)" : ""}</label>
+            <input class="u-nom" value="${esc(u.nom || "")}" placeholder="Nom du membre" />
+            <div class="field-row" style="margin-top:8px">
+              <div><label style="margin-top:0">Rôle</label>
+                <select class="u-role">
+                  <option value="livreur" ${u.role !== "admin" ? "selected" : ""}>Livreur</option>
+                  <option value="admin" ${u.role === "admin" ? "selected" : ""}>Administrateur</option>
+                </select></div>
+              <div><label style="margin-top:0">Accès</label>
+                <select class="u-actif">
+                  <option value="1" ${u.actif !== false ? "selected" : ""}>Actif</option>
+                  <option value="0" ${u.actif === false ? "selected" : ""}>Désactivé</option>
+                </select></div>
+            </div>
+            <button class="btn sec block u-save" data-uid="${u.id}" style="margin-top:8px">Enregistrer</button>
+          </div>`).join("")}
+        <div class="card"><div class="sub">Un désactivé ne peut plus se connecter. La création d'un compte se fait par la personne elle-même (écran de connexion → « Créer un compte »). Le changement de mot de passe/e-mail et la suppression définitive passent par la console Supabase.</div></div>
         <div class="section-title">Clients importés de Sextan à valider${aValider.length ? ` (${aValider.length})` : ""}</div>
         ${aValider.length ? aValider.map((c) => `
           <div class="card"><div class="row between">
@@ -1544,13 +1558,18 @@ Total : ${eur(total)} HT`;
             : `<div class="sub">Les types apparaîtront ici dès que des prestations Sextan seront synchronisées avec leur type. (Sinon, ça se remplit tout seul au prochain import.)</div>`}
         </div>
       </main>`;
-    $$(".role-toggle").forEach((b) => b.onclick = async () => {
-      const newRole = b.dataset.role === "admin" ? "livreur" : "admin";
-      if (b.dataset.id === state.user.id && newRole !== "admin")
-        return toast("Tu ne peux pas te retirer ton propre rôle admin.", "err");
-      const { error } = await sb.from("profiles").update({ role: newRole }).eq("id", b.dataset.id);
+    $$(".u-save").forEach((b) => b.onclick = async () => {
+      const card = b.closest("[data-uid]"), uid = b.dataset.uid;
+      const nom = card.querySelector(".u-nom").value.trim();
+      const role = card.querySelector(".u-role").value;
+      const actif = card.querySelector(".u-actif").value === "1";
+      if (uid === state.user.id && role !== "admin") return toast("Tu ne peux pas retirer ton propre rôle admin.", "err");
+      if (uid === state.user.id && !actif) return toast("Tu ne peux pas désactiver ton propre compte.", "err");
+      b.disabled = true;
+      const { error } = await sb.from("profiles").update({ nom: nom || null, role, actif }).eq("id", uid);
+      b.disabled = false;
       if (error) return toast(error.message, "err");
-      toast("Rôle mis à jour ✔", "ok"); render();
+      toast("Compte enregistré ✔", "ok"); render();
     });
     $$(".valider-cli").forEach((b) => b.onclick = async () => {
       b.disabled = true;
@@ -2288,6 +2307,17 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
     state.user = data.user;
     const { data: prof } = await sb.from("profiles").select("*").eq("id", data.user.id).maybeSingle();
     state.profile = prof;
+    // Compte désactivé par un admin -> accès bloqué
+    if (prof && prof.actif === false) {
+      await sb.auth.signOut();
+      app.innerHTML = `<div class="login-wrap">
+        <div class="login-logo"><span class="leaf">🌿</span> GreenLoop</div>
+        <div class="card"><h3>Compte désactivé</h3>
+          <p class="sub">Ton accès a été désactivé par un administrateur. Contacte ton responsable si c'est une erreur.</p>
+          <button class="btn block" onclick="location.reload()">Retour à la connexion</button>
+        </div></div>`;
+      return;
+    }
     // Onglet Admin (uniquement pour les admins)
     if (isAdmin() && !$("#nav-admin")) {
       const b = document.createElement("button");
