@@ -582,11 +582,11 @@
     // Tags / packs (pour le filtre de sortie) + présélection auto selon le type Sextan
     const allTags = sens === "sortie" ? await db.tags() : [];
     const baseTags = allTags.filter((t) => t.is_base).map((t) => t.nom);
-    let preselTag = "__all__";
+    let preselTags = []; // packs présélectionnés (peut être plusieurs)
     if (sens === "sortie" && p.type_presta) {
       const map = await db.typeTagMap();
-      const hit = map.find((m) => m.sextan_type === p.type_presta && m.tag);
-      if (hit && allTags.some((t) => t.nom === hit.tag)) preselTag = hit.tag;
+      const hit = map.find((m) => m.sextan_type === p.type_presta);
+      if (hit) preselTags = (hit.tags || []).filter((t) => allTags.some((x) => x.nom === t));
     }
 
     // Précharge les quantités déjà enregistrées pour ce sens (permet de revoir / corriger / annuler).
@@ -641,10 +641,10 @@
         </div>
 
         ${sens === "sortie" && allTags.length ? `
-        <div class="section-title">Pack à préparer${preselTag !== "__all__" ? ` — présélectionné : ${esc(preselTag)}` : ""}</div>
+        <div class="section-title">Packs à préparer${preselTags.length ? ` — présélection : ${esc(preselTags.join(", "))}` : ""}</div>
         <div id="tag-filter" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-          <button type="button" class="tagf" data-tag="__all__" style="${chipCss(preselTag === "__all__")}">Tout</button>
-          ${allTags.map((tg) => `<button type="button" class="tagf" data-tag="${esc(tg.nom)}" style="${chipCss(preselTag === tg.nom)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`).join("")}
+          <button type="button" class="tagf" data-tag="__all__" style="${chipCss(preselTags.length === 0)}">Tout</button>
+          ${allTags.map((tg) => { const on = preselTags.includes(tg.nom); return `<button type="button" class="tagf" data-tag="${esc(tg.nom)}" data-on="${on ? "1" : "0"}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
         </div>` : ""}
 
         <div class="section-title">Matériel ${verb}</div>
@@ -756,12 +756,19 @@
     $("#manual-add").onclick = () => { addCode($("#manual-code").value); $("#manual-code").value = ""; };
     $("#manual-code").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#manual-add").click(); });
 
-    // Filtre par pack (sortie) : n'affiche que le pack choisi + le matériel de base
-    const applyTagFilter = (activeTag) => {
-      const showAll = activeTag === "__all__";
+    // Filtre par packs (sortie), multi-sélection : affiche l'union des packs choisis + le matériel de base.
+    const activeTags = new Set(preselTags);
+    const tf = $("#tag-filter");
+    const restyle = () => {
+      const allBtn = tf.querySelector('.tagf[data-tag="__all__"]');
+      if (allBtn) allBtn.style.cssText = chipCss(activeTags.size === 0);
+      tf.querySelectorAll('.tagf:not([data-tag="__all__"])').forEach((x) => (x.style.cssText = chipCss(activeTags.has(x.dataset.tag))));
+    };
+    const applyTagFilter = () => {
+      const showAll = activeTags.size === 0;
       $$("#qty-card .mat-line").forEach((line) => {
         const tgs = (line.dataset.tags || "").split("|").filter(Boolean);
-        const show = showAll || tgs.includes(activeTag) || tgs.some((x) => baseTags.includes(x));
+        const show = showAll || tgs.some((x) => activeTags.has(x)) || tgs.some((x) => baseTags.includes(x));
         line.style.display = show ? "" : "none";
       });
       $$("#qty-card .matgroup").forEach((g) => {
@@ -769,18 +776,16 @@
         g.style.display = anyVisible ? "" : "none";
       });
     };
-    const tf = $("#tag-filter");
     if (tf) {
       tf.querySelectorAll(".tagf").forEach((b) => b.onclick = () => {
-        tf.querySelectorAll(".tagf").forEach((x) => (x.style.cssText = chipCss(false)));
-        b.style.cssText = chipCss(true);
-        applyTagFilter(b.dataset.tag);
+        if (b.dataset.tag === "__all__") activeTags.clear();
+        else { activeTags.has(b.dataset.tag) ? activeTags.delete(b.dataset.tag) : activeTags.add(b.dataset.tag); }
+        restyle(); applyTagFilter();
       });
-      applyTagFilter(preselTag);
-      // sécurité : si le pack présélectionné n'affiche rien (matériel pas encore taggé), on retombe sur « Tout »
-      if (preselTag !== "__all__" && !$$("#qty-card .mat-line").some((l) => l.style.display !== "none")) {
-        tf.querySelectorAll(".tagf").forEach((x) => (x.style.cssText = chipCss(x.dataset.tag === "__all__")));
-        applyTagFilter("__all__");
+      applyTagFilter();
+      // sécurité : si la présélection n'affiche rien (matériel pas encore taggé), on retombe sur « Tout »
+      if (activeTags.size && !$$("#qty-card .mat-line").some((l) => l.style.display !== "none")) {
+        activeTags.clear(); restyle(); applyTagFilter();
       }
     }
 
@@ -1489,7 +1494,7 @@ Total : ${eur(total)} HT`;
     ]);
     const freq = recapFreq || "1_15";
     const distinctTypes = [...new Set((typeRows || []).map((p) => p.type_presta).filter(Boolean))].sort();
-    const mapOf = {}; (curMap || []).forEach((m) => (mapOf[m.sextan_type] = m.tag));
+    const mapOf = {}; (curMap || []).forEach((m) => (mapOf[m.sextan_type] = m.tags || []));
     const freqOpts = [["1_15", "Le 1ᵉʳ et le 15 du mois"], ["1", "Le 1ᵉʳ du mois"], ["15", "Le 15 du mois"], ["hebdo", "Chaque lundi"], ["off", "Désactivé (aucun envoi)"]];
     app.innerHTML =
       topbar("Espace admin") +
@@ -1544,16 +1549,15 @@ Total : ${eur(total)} HT`;
           <button class="btn block" id="a-recap-save" style="margin-top:8px">Enregistrer les réglages du récap</button>
         </div>
 
-        <div class="section-title">Pack présélectionné par type de prestation (Sextan)</div>
+        <div class="section-title">Packs présélectionnés par type de prestation (Sextan)</div>
         <div class="card">
-          <div class="sub" style="margin-bottom:8px">Associe chaque type de prestation Sextan à un pack : à la sortie, le livreur verra ce pack déjà filtré (il pourra en changer librement).</div>
+          <div class="sub" style="margin-bottom:8px">Associe chaque type de prestation Sextan à <b>un ou plusieurs packs</b> : à la sortie, le livreur verra ces packs déjà filtrés (il pourra en changer librement).</div>
           ${distinctTypes.length ? distinctTypes.map((ty) => `
-            <div class="row between" style="gap:8px;margin-bottom:8px">
-              <b style="flex:0 0 42%;min-width:0;word-break:break-word">${esc(ty)}</b>
-              <select class="ttag" data-type="${esc(ty)}" style="flex:1">
-                <option value="">— aucun —</option>
-                ${adminTags.map((tg) => `<option value="${esc(tg.nom)}" ${mapOf[ty] === tg.nom ? "selected" : ""}>${esc(tg.nom)}</option>`).join("")}
-              </select>
+            <div style="margin-bottom:12px">
+              <b style="word-break:break-word">${esc(ty)}</b>
+              <div class="ttag-group" data-type="${esc(ty)}" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:5px">
+                ${adminTags.map((tg) => { const on = (mapOf[ty] || []).includes(tg.nom); return `<button type="button" class="ttag" data-tag="${esc(tg.nom)}" data-on="${on ? "1" : "0"}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
+              </div>
             </div>`).join("") + `<button class="btn block" id="a-map-save" style="margin-top:8px">Enregistrer les correspondances</button>`
             : `<div class="sub">Les types apparaîtront ici dès que des prestations Sextan seront synchronisées avec leur type. (Sinon, ça se remplit tout seul au prochain import.)</div>`}
         </div>
@@ -1588,9 +1592,16 @@ Total : ${eur(total)} HT`;
       const err = (r1 && r1.error) || (r2 && r2.error);
       toast(err ? err.message : "Réglages du récap enregistrés ✔", err ? "err" : "ok");
     };
+    $$(".ttag-group .ttag").forEach((b) => b.onclick = () => {
+      b.dataset.on = b.dataset.on === "1" ? "0" : "1";
+      b.style.cssText = chipCss(b.dataset.on === "1");
+    });
     const mapSave = $("#a-map-save");
     if (mapSave) mapSave.onclick = async () => {
-      const rows = $$(".ttag").map((s) => ({ sextan_type: s.dataset.type, tag: s.value || null }));
+      const rows = $$(".ttag-group").map((g) => ({
+        sextan_type: g.dataset.type,
+        tags: Array.from(g.querySelectorAll(".ttag")).filter((c) => c.dataset.on === "1").map((c) => c.dataset.tag),
+      }));
       const { error } = await sb.from("sextan_type_tags").upsert(rows, { onConflict: "sextan_type" });
       toast(error ? error.message : "Correspondances enregistrées ✔", error ? "err" : "ok");
     };
