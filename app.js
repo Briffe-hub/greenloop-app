@@ -80,6 +80,8 @@
     soldeClient: (cid) => db.q("v_solde_client", (q) => q.eq("client_id", cid)),
     soldeAll: () => db.q("v_solde_client"),
     categories: () => db.q("materiel_categories", (q) => q.order("nom")),
+    tags: () => db.q("materiel_tags", (q) => q.order("is_base", { ascending: false }).order("nom")),
+    typeTagMap: () => db.q("sextan_type_tags"),
     prestationsByClient: (cid) =>
       db.q("prestations", (q) => q.eq("client_id", cid).order("date_presta", { ascending: false })),
     param: async (cle) => {
@@ -164,6 +166,8 @@
       if (head === "materiel" && parts.length === 1) return viewMateriel();
       if (head === "archives") return viewArchives();
       if (head === "categories") return viewCategories();
+      if (head === "tags") return viewTags();
+      if (head === "masse") return viewMasse();
       if (head === "journal") return viewParcJournal(parts[1]);
       if (head === "admin") return viewAdmin();
       if (head === "type") return viewTypeDetail(parts[1]);
@@ -220,6 +224,12 @@
 
   // Normalisation pour recherche (sans accents ni casse)
   function _norm(s) { return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
+
+  // Style d'une "puce" tag (on/off) — inline pour éviter une dépendance CSS à déployer
+  function chipCss(on) {
+    return `border:1px solid ${on ? "var(--green)" : "var(--line)"};background:${on ? "#dcfce7" : "#fff"};`
+      + `color:${on ? "var(--green-d)" : "var(--muted)"};padding:8px 13px;border-radius:999px;font-size:13px;font-weight:700;cursor:pointer`;
+  }
 
   // Sélecteur de client réutilisable : recherche par nom + filtre Fixe/Ponctuel.
   // Écrit l'id choisi dans un input caché #f-client (compatible avec le code existant).
@@ -569,6 +579,16 @@
     const label = sens === "sortie" ? "Sortie" : "Retour";
     const verb = sens === "sortie" ? "livrés" : "récupérés";
 
+    // Tags / packs (pour le filtre de sortie) + présélection auto selon le type Sextan
+    const allTags = sens === "sortie" ? await db.tags() : [];
+    const baseTags = allTags.filter((t) => t.is_base).map((t) => t.nom);
+    let preselTag = "__all__";
+    if (sens === "sortie" && p.type_presta) {
+      const map = await db.typeTagMap();
+      const hit = map.find((m) => m.sextan_type === p.type_presta && m.tag);
+      if (hit && allTags.some((t) => t.nom === hit.tag)) preselTag = hit.tag;
+    }
+
     // Précharge les quantités déjà enregistrées pour ce sens (permet de revoir / corriger / annuler).
     const [mvtRes, factRes] = await Promise.all([
       sb.from("mouvements").select("type_id,quantite").eq("prestation_id", id).eq("sens", sens),
@@ -599,7 +619,7 @@
       types.map((t) => `<option value="${t.id}">${esc(t.nom)}</option>`).join("");
 
     const lineHtml = (t) => `
-      <div class="mat-line" data-line="${t.id}">
+      <div class="mat-line" data-line="${t.id}" data-tags="${esc((t.tags || []).join("|"))}">
         <div class="name"><b>${esc(t.nom)}</b><small>${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR — saisie manuelle"}</small></div>
         <div class="qty" data-type="${t.id}">
           <button data-d="-1">−</button>
@@ -620,10 +640,17 @@
           </div>
         </div>
 
+        ${sens === "sortie" && allTags.length ? `
+        <div class="section-title">Pack à préparer${preselTag !== "__all__" ? ` — présélectionné : ${esc(preselTag)}` : ""}</div>
+        <div id="tag-filter" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+          <button type="button" class="tagf" data-tag="__all__" style="${chipCss(preselTag === "__all__")}">Tout</button>
+          ${allTags.map((tg) => `<button type="button" class="tagf" data-tag="${esc(tg.nom)}" style="${chipCss(preselTag === tg.nom)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`).join("")}
+        </div>` : ""}
+
         <div class="section-title">Matériel ${verb}</div>
         <div class="list" id="qty-card">
           ${Object.keys(byCat).sort().map((cat) => `
-            <div class="card">
+            <div class="card matgroup">
               <div class="sub" style="font-weight:700;margin-bottom:4px">${esc(cat)}</div>
               ${byCat[cat].map(lineHtml).join("")}
             </div>`).join("")}
@@ -729,6 +756,34 @@
     $("#manual-add").onclick = () => { addCode($("#manual-code").value); $("#manual-code").value = ""; };
     $("#manual-code").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#manual-add").click(); });
 
+    // Filtre par pack (sortie) : n'affiche que le pack choisi + le matériel de base
+    const applyTagFilter = (activeTag) => {
+      const showAll = activeTag === "__all__";
+      $$("#qty-card .mat-line").forEach((line) => {
+        const tgs = (line.dataset.tags || "").split("|").filter(Boolean);
+        const show = showAll || tgs.includes(activeTag) || tgs.some((x) => baseTags.includes(x));
+        line.style.display = show ? "" : "none";
+      });
+      $$("#qty-card .matgroup").forEach((g) => {
+        const anyVisible = Array.from(g.querySelectorAll(".mat-line")).some((l) => l.style.display !== "none");
+        g.style.display = anyVisible ? "" : "none";
+      });
+    };
+    const tf = $("#tag-filter");
+    if (tf) {
+      tf.querySelectorAll(".tagf").forEach((b) => b.onclick = () => {
+        tf.querySelectorAll(".tagf").forEach((x) => (x.style.cssText = chipCss(false)));
+        b.style.cssText = chipCss(true);
+        applyTagFilter(b.dataset.tag);
+      });
+      applyTagFilter(preselTag);
+      // sécurité : si le pack présélectionné n'affiche rien (matériel pas encore taggé), on retombe sur « Tout »
+      if (preselTag !== "__all__" && !$$("#qty-card .mat-line").some((l) => l.style.display !== "none")) {
+        tf.querySelectorAll(".tagf").forEach((x) => (x.style.cssText = chipCss(x.dataset.tag === "__all__")));
+        applyTagFilter("__all__");
+      }
+    }
+
     updateRecap(); // reflète les quantités déjà saisies au chargement
     startScanner(addCode);
 
@@ -791,7 +846,8 @@
       } else {
         nextStatut = (totalSaisi > 0 || facts.length) ? "recupere" : "a_recuperer";
       }
-      await sb.from("prestations").update({ statut: nextStatut }).eq("id", id);
+      const stErr = (await sb.from("prestations").update({ statut: nextStatut }).eq("id", id)).error;
+      if (stErr) { $("#valider").disabled = false; return toast("Statut : " + stErr.message, "err"); }
       stopScanner();
       const msg = sens === "sortie"
         ? (totalSaisi > 0 ? `Sortie enregistrée (${totalSaisi} pièce(s)) ✔` : "Sortie annulée ✔")
@@ -1073,13 +1129,92 @@ Total : ${eur(total)} HT`;
       `<main>
         <div class="btn-grid" style="margin-bottom:12px">
           <button class="btn sec" onclick="location.hash='#/categories'">🏷️ Catégories</button>
+          <button class="btn sec" onclick="location.hash='#/tags'">🎟️ Tags / packs</button>
           <button class="btn sec" id="csv">⬇︎ Export CSV</button>
+          ${isAdmin() ? `<button class="btn sec" onclick="location.hash='#/masse'">✏️ Édition en masse</button>` : ""}
         </div>
         ${types.length ? body : '<div class="empty"><div class="big">📦</div>Aucun matériel.</div>'}
         ${archived.length ? `<button class="btn ghost block" style="margin-top:16px" onclick="location.hash='#/archives'">🗄 Matériel archivé (${archived.length})</button>` : ""}
       </main>
        <button class="fab" onclick="location.hash='#/type/new'">＋</button>`;
     $("#csv").onclick = () => exportTypesCSV(types);
+  }
+
+  // =========================================================================
+  //  VUE : Édition en masse du matériel (tableau éditable + matrice de tags)
+  // =========================================================================
+  async function viewMasse() {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Édition en masse") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const [types, cats, tags] = await Promise.all([db.types(), db.categories(), db.tags()]);
+    const inCss = "width:100%;padding:6px 7px;font-size:13px;border:1px solid var(--line);border-radius:8px;background:#fff";
+    const catOptions = (sel) => `<option value="">—</option>` + cats.map((c) => `<option ${c.nom === sel ? "selected" : ""}>${esc(c.nom)}</option>`).join("");
+    const rowHtml = (t) => {
+      const tg = t.tags || [];
+      return `<tr data-id="${t.id || ""}">
+        <td style="position:sticky;left:0;background:#fff;padding:5px;min-width:150px;box-shadow:1px 0 0 var(--line)"><input class="m-nom" value="${esc(t.nom || "")}" placeholder="Nom" style="${inCss}" /></td>
+        <td style="padding:5px"><select class="m-cat" style="${inCss};min-width:120px">${catOptions(t.categorie)}</select></td>
+        <td style="padding:5px"><input class="m-prix" type="number" step="0.01" value="${t.prix_unitaire || 0}" style="${inCss};width:78px" /></td>
+        <td style="padding:5px"><input class="m-code" value="${esc(t.code_qr || "")}" placeholder="auto" style="${inCss};width:120px;font-family:monospace" /></td>
+        ${tags.map((tag) => `<td style="text-align:center;padding:5px"><input type="checkbox" class="m-tag" data-tag="${esc(tag.nom)}" ${tg.includes(tag.nom) ? "checked" : ""} style="width:20px;height:20px" /></td>`).join("")}
+        <td style="text-align:center;padding:5px"><input type="checkbox" class="m-actif" ${t.actif !== false ? "checked" : ""} style="width:20px;height:20px" /></td>
+      </tr>`;
+    };
+    app.innerHTML =
+      topbar("Édition en masse", { back: "materiel" }) +
+      `<main>
+        <div class="sub" style="margin-bottom:8px">Modifie tout d'un coup : nom, catégorie, prix HT, code QR et tags (cases à cocher). Fais défiler vers la droite pour voir toutes les colonnes de tags. Le <b>parc</b> se règle sur la fiche (journal), pas ici.</div>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:12px">
+          <table style="border-collapse:collapse;font-size:13px;background:#fff;white-space:nowrap">
+            <thead><tr style="background:#f3f4f6">
+              <th style="position:sticky;left:0;background:#f3f4f6;padding:8px;text-align:left;box-shadow:1px 0 0 var(--line)">Nom</th>
+              <th style="padding:8px">Catégorie</th><th style="padding:8px">Prix HT €</th><th style="padding:8px">Code QR</th>
+              ${tags.map((t) => `<th style="padding:8px">${esc(t.nom)}${t.is_base ? " ★" : ""}</th>`).join("")}
+              <th style="padding:8px">Actif</th>
+            </tr></thead>
+            <tbody id="masse-body">${types.map(rowHtml).join("")}</tbody>
+          </table>
+        </div>
+        <button class="btn sec block" id="m-add" style="margin-top:10px">＋ Ajouter une ligne</button>
+        <button class="btn block" id="m-save" style="margin-top:8px">💾 Enregistrer tout</button>
+        <div class="sub" style="text-align:center;margin-top:6px">${types.length} matériel(s) · <a href="#/tags" style="color:var(--green)">gérer les tags</a></div>
+      </main>`;
+
+    $("#m-add").onclick = () => {
+      $("#masse-body").insertAdjacentHTML("beforeend", rowHtml({ actif: true, tags: [] }));
+      const rows = $$("#masse-body tr");
+      rows[rows.length - 1].querySelector(".m-nom").focus();
+    };
+    $("#m-save").onclick = async () => {
+      const rows = [];
+      let bad = false;
+      $$("#masse-body tr").forEach((tr) => {
+        const nom = tr.querySelector(".m-nom").value.trim();
+        if (!nom) return; // ligne vide ignorée
+        let code = tr.querySelector(".m-code").value.trim();
+        // toutes les lignes portent un id (clés uniformes = requis par l'upsert groupé) ;
+        // une nouvelle ligne reçoit un id neuf -> insertion, une ligne existante -> mise à jour.
+        const id = tr.dataset.id || (crypto.randomUUID ? crypto.randomUUID() : ("" + Date.now() + Math.random()));
+        rows.push({
+          id,
+          nom,
+          categorie: tr.querySelector(".m-cat").value || null,
+          prix_unitaire: parseFloat(tr.querySelector(".m-prix").value) || 0,
+          code_qr: code || slugCode(nom),
+          tags: Array.from(tr.querySelectorAll(".m-tag")).filter((c) => c.checked).map((c) => c.dataset.tag),
+          actif: tr.querySelector(".m-actif").checked,
+        });
+      });
+      if (!rows.length) return toast("Rien à enregistrer", "err");
+      $("#m-save").disabled = true;
+      const { error } = await sb.from("materiel_types").upsert(rows, { onConflict: "id" });
+      $("#m-save").disabled = false;
+      if (error) return toast(error.message.includes("duplicate") || error.code === "23505" ? "Un code QR est en double — corrige-le" : error.message, "err");
+      toast(`${rows.length} matériel(s) enregistré(s) ✔`, "ok");
+      render();
+    };
   }
 
   // =========================================================================
@@ -1168,6 +1303,73 @@ Total : ${eur(total)} HT`;
         const { error } = await sb.from("materiel_categories").delete().eq("id", b.dataset.id);
         if (error) return toast(error.message, "err");
         toast("Catégorie supprimée ✔", "ok"); render();
+      };
+    });
+  }
+
+  // =========================================================================
+  //  VUE : Tags / packs livreur (gestion)
+  // =========================================================================
+  async function viewTags() {
+    const tags = await db.tags();
+    app.innerHTML =
+      topbar("Tags / packs", { back: "materiel" }) +
+      `<main>
+        <div class="card">
+          <label>Nouveau tag</label>
+          <div class="field-row">
+            <input id="tg-new" placeholder="Ex : Mariages" />
+            <button class="btn sm" id="tg-add" style="flex:0 0 auto">Ajouter</button>
+          </div>
+          <div class="sub" style="margin-top:6px">Un tag « base » (★) reste toujours visible à la sortie, en plus du pack choisi (ex. les caisses communes).</div>
+        </div>
+        <div class="section-title">Tags existants</div>
+        ${tags.length ? tags.map((t) => `
+          <div class="card">
+            <div class="row" style="gap:8px">
+              <input class="tg-nom" data-id="${t.id}" data-old="${esc(t.nom)}" value="${esc(t.nom)}" style="flex:1" />
+              <button class="btn sm sec tg-save" data-id="${t.id}" style="flex:0 0 auto">✓</button>
+              <button class="btn sm ghost tg-del" data-id="${t.id}" data-nom="${esc(t.nom)}" style="flex:0 0 auto;color:var(--danger)">🗑</button>
+            </div>
+            <button type="button" class="tg-base" data-id="${t.id}" data-base="${t.is_base}" style="${chipCss(t.is_base)};margin-top:8px">★ Pack de base ${t.is_base ? ": OUI" : ": non"}</button>
+          </div>`).join("") : '<div class="sub">Aucun tag pour l\'instant.</div>'}
+      </main>`;
+
+    $("#tg-add").onclick = async () => {
+      const nom = $("#tg-new").value.trim();
+      if (!nom) return;
+      const { error } = await sb.from("materiel_tags").insert({ nom });
+      if (error) return toast(error.message.includes("duplicate") ? "Ce tag existe déjà" : error.message, "err");
+      toast("Tag ajouté ✔", "ok"); render();
+    };
+    $$(".tg-base").forEach((b) => b.onclick = async () => {
+      const next = b.dataset.base !== "true";
+      const { error } = await sb.from("materiel_tags").update({ is_base: next }).eq("id", b.dataset.id);
+      if (error) return toast(error.message, "err");
+      toast("Réglage enregistré ✔", "ok"); render();
+    });
+    $$(".tg-save").forEach((b) => b.onclick = async () => {
+      const inp = $(`.tg-nom[data-id="${b.dataset.id}"]`);
+      const nouveau = inp.value.trim(), ancien = inp.dataset.old;
+      if (!nouveau || nouveau === ancien) return;
+      // renomme le tag partout : dans les matériels et dans la correspondance type Sextan
+      const { data: aff } = await sb.from("materiel_types").select("id,tags").contains("tags", [ancien]);
+      for (const m of (aff || [])) await sb.from("materiel_types").update({ tags: (m.tags || []).map((x) => x === ancien ? nouveau : x) }).eq("id", m.id);
+      const e1 = (await sb.from("materiel_tags").update({ nom: nouveau }).eq("id", b.dataset.id)).error;
+      if (e1) return toast(e1.message.includes("duplicate") ? "Ce tag existe déjà" : e1.message, "err");
+      await sb.from("sextan_type_tags").update({ tag: nouveau }).eq("tag", ancien);
+      toast("Tag renommé ✔", "ok"); render();
+    });
+    $$(".tg-del").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) { armed = true; b.textContent = "Confirmer ?"; setTimeout(() => { armed = false; b.textContent = "🗑"; }, 3000); return; }
+        const { data: aff } = await sb.from("materiel_types").select("id,tags").contains("tags", [b.dataset.nom]);
+        for (const m of (aff || [])) await sb.from("materiel_types").update({ tags: (m.tags || []).filter((x) => x !== b.dataset.nom) }).eq("id", m.id);
+        await sb.from("sextan_type_tags").update({ tag: null }).eq("tag", b.dataset.nom);
+        const { error } = await sb.from("materiel_tags").delete().eq("id", b.dataset.id);
+        if (error) return toast(error.message, "err");
+        toast("Tag supprimé ✔", "ok"); render();
       };
     });
   }
@@ -1279,11 +1481,15 @@ Total : ${eur(total)} HT`;
       app.innerHTML = topbar("Admin") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
       return;
     }
-    const [users, compta, recapEmails, recapFreq, aValider] = await Promise.all([
+    const [users, compta, recapEmails, recapFreq, aValider, adminTags, curMap, typeRows] = await Promise.all([
       db.usersList(), db.param("email_compta"), db.param("recap_emails"), db.param("recap_frequence"),
       db.q("clients", (q) => q.eq("sextan_auto", true).order("nom")),
+      db.tags(), db.typeTagMap(),
+      db.q("prestations", (q) => q.not("type_presta", "is", null)),
     ]);
     const freq = recapFreq || "1_15";
+    const distinctTypes = [...new Set((typeRows || []).map((p) => p.type_presta).filter(Boolean))].sort();
+    const mapOf = {}; (curMap || []).forEach((m) => (mapOf[m.sextan_type] = m.tag));
     const freqOpts = [["1_15", "Le 1ᵉʳ et le 15 du mois"], ["1", "Le 1ᵉʳ du mois"], ["15", "Le 15 du mois"], ["hebdo", "Chaque lundi"], ["off", "Désactivé (aucun envoi)"]];
     app.innerHTML =
       topbar("Espace admin") +
@@ -1323,6 +1529,20 @@ Total : ${eur(total)} HT`;
           <div class="sub" style="margin-top:4px">Chaque adresse doit exister dans les contacts Briffe. Envoi vers 8h (heure de Paris).</div>
           <button class="btn block" id="a-recap-save" style="margin-top:8px">Enregistrer les réglages du récap</button>
         </div>
+
+        <div class="section-title">Pack présélectionné par type de prestation (Sextan)</div>
+        <div class="card">
+          <div class="sub" style="margin-bottom:8px">Associe chaque type de prestation Sextan à un pack : à la sortie, le livreur verra ce pack déjà filtré (il pourra en changer librement).</div>
+          ${distinctTypes.length ? distinctTypes.map((ty) => `
+            <div class="row between" style="gap:8px;margin-bottom:8px">
+              <b style="flex:0 0 42%;min-width:0;word-break:break-word">${esc(ty)}</b>
+              <select class="ttag" data-type="${esc(ty)}" style="flex:1">
+                <option value="">— aucun —</option>
+                ${adminTags.map((tg) => `<option value="${esc(tg.nom)}" ${mapOf[ty] === tg.nom ? "selected" : ""}>${esc(tg.nom)}</option>`).join("")}
+              </select>
+            </div>`).join("") + `<button class="btn block" id="a-map-save" style="margin-top:8px">Enregistrer les correspondances</button>`
+            : `<div class="sub">Les types apparaîtront ici dès que des prestations Sextan seront synchronisées avec leur type. (Sinon, ça se remplit tout seul au prochain import.)</div>`}
+        </div>
       </main>`;
     $$(".role-toggle").forEach((b) => b.onclick = async () => {
       const newRole = b.dataset.role === "admin" ? "livreur" : "admin";
@@ -1348,6 +1568,12 @@ Total : ${eur(total)} HT`;
       const [r1, r2] = await Promise.all([db.setParam("recap_emails", list), db.setParam("recap_frequence", f)]);
       const err = (r1 && r1.error) || (r2 && r2.error);
       toast(err ? err.message : "Réglages du récap enregistrés ✔", err ? "err" : "ok");
+    };
+    const mapSave = $("#a-map-save");
+    if (mapSave) mapSave.onclick = async () => {
+      const rows = $$(".ttag").map((s) => ({ sextan_type: s.dataset.type, tag: s.value || null }));
+      const { error } = await sb.from("sextan_type_tags").upsert(rows, { onConflict: "sextan_type" });
+      toast(error ? error.message : "Correspondances enregistrées ✔", error ? "err" : "ok");
     };
   }
 
@@ -1396,8 +1622,9 @@ Total : ${eur(total)} HT`;
 
   async function viewTypeDetail(tid) {
     const isNew = tid === "new";
-    let t = { nom: "", categorie: "", unite: "pièce", prix_unitaire: 0, code_qr: "", stock_total: 0 };
+    let t = { nom: "", categorie: "", unite: "pièce", prix_unitaire: 0, code_qr: "", stock_total: 0, tags: [] };
     const cats = await db.categories();
+    const allTags = await db.tags();
     let soldes = [], clientsMap = {}, journal = [];
     if (!isNew) {
       t = await db.type(tid);
@@ -1429,6 +1656,11 @@ Total : ${eur(total)} HT`;
               <input id="t-stock" type="number" step="1" value="${t.stock_total || 0}" ${parkLocked ? "readonly style=\"background:#f1f3f0\"" : ""} /></div>
           </div>
           ${parkLocked ? `<div class="sub" style="margin-top:-4px">Le parc est verrouillé après la 1ʳᵉ saisie. Toute modification passe par le <b>journal du parc</b> (admin) avec justification.</div>` : `<div class="sub" style="margin-top:-4px">Première saisie du parc : indique la quantité possédée. Ensuite, elle ne sera modifiable que par un admin avec justification.</div>`}
+          <label>Tags / packs livreur</label>
+          <div id="t-tags" style="display:flex;flex-wrap:wrap;gap:6px">
+            ${allTags.map((tg) => { const on = (t.tags || []).includes(tg.nom); return `<button type="button" class="tagchip" data-tag="${esc(tg.nom)}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
+          </div>
+          <div class="sub" style="margin-top:4px">Coche les packs où ce matériel doit apparaître à la sortie (Cocktails, Buffets…). ★ = pack de base (toujours visible). <a href="#/tags" style="color:var(--green)">Gérer les tags</a></div>
           <label>Code QR (identique sur tous les exemplaires de ce type)</label>
           <div class="field-row">
             <input id="t-code" value="${esc(t.code_qr||"")}" placeholder="GL-…" style="font-family:monospace" />
@@ -1481,6 +1713,16 @@ Total : ${eur(total)} HT`;
     $("#t-cat").onchange = (e) => {
       $("#t-cat-new").style.display = e.target.value === "__new__" ? "block" : "none";
     };
+
+    // tags : puces à bascule
+    const tagSet = new Set(t.tags || []);
+    $$("#t-tags .tagchip").forEach((b) => {
+      b.onclick = () => {
+        if (tagSet.has(b.dataset.tag)) tagSet.delete(b.dataset.tag);
+        else tagSet.add(b.dataset.tag);
+        b.style.cssText = chipCss(tagSet.has(b.dataset.tag));
+      };
+    });
 
     // aperçu du QR
     const prev = $("#qr-preview");
@@ -1544,6 +1786,7 @@ Total : ${eur(total)} HT`;
         prix_unitaire: parseFloat($("#t-prix").value) || 0,
         stock_total: parcInitial,
         code_qr: code || null,
+        tags: Array.from(tagSet),
       };
       $("#save").disabled = true;
       let error, newId = tid;
