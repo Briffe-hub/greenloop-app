@@ -176,6 +176,7 @@
       if (head === "client") {
         if (parts[1] === "new") return viewClientForm("new");
         if (parts[2] === "edit") return viewClientForm(parts[1]);
+        if (parts[2] === "retard") return viewRetardClient(parts[1]);
         return viewClientDetail(parts[1]);
       }
       if (head === "parametres") return viewParametres();
@@ -287,7 +288,9 @@
   //  VUE : Liste des prestations
   // =========================================================================
   async function viewPrestations() {
-    const list = await db.prestations();
+    const all = await db.prestations();
+    const list = all.filter((p) => !p.archivee);      // actives
+    const archived = all.filter((p) => p.archivee);   // archivées (masquées par défaut)
     const cli = {};
     (await db.clients()).forEach((c) => (cli[c.id] = c));
 
@@ -326,6 +329,7 @@
           <button class="btn sm sec" id="psort" style="width:auto">📅 Plus proches d'abord ↑</button>
         </div>
         <div id="plist"></div>
+        ${archived.length ? `<button class="btn ghost block" id="parch-toggle" style="margin-top:16px">🗄 Prestations archivées (${archived.length})</button><div id="parch" class="hidden" style="margin-top:8px"></div>` : ""}
       </main>
       <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
 
@@ -361,6 +365,18 @@
       draw();
     };
     draw();
+
+    // Section archivées (repliée par défaut)
+    const parchToggle = $("#parch-toggle");
+    if (parchToggle) parchToggle.onclick = () => {
+      const box = $("#parch");
+      const open = box.classList.toggle("hidden") === false;
+      parchToggle.textContent = (open ? "🗄 Masquer les archivées" : "🗄 Prestations archivées") + ` (${archived.length})`;
+      if (open && !box.dataset.drawn) {
+        box.dataset.drawn = "1";
+        box.innerHTML = archived.slice().sort(byDate).map(card).join("");
+      }
+    };
   }
 
   // =========================================================================
@@ -535,6 +551,32 @@
       ${!fixe ? ` · <a href="#/prestation/${id}/recuperation" style="color:var(--muted)">Récupération</a>` : ` · <a href="#/prestation/${id}/retour" style="color:var(--muted)">Récupération</a>`}
     </div>`);
 
+    // Commentaire livreur -> logistique (livraison + récupération)
+    if (["en_livraison", "a_recuperer", "recupere", "livre"].includes(p.statut)) {
+      const cwrap = document.createElement("div");
+      cwrap.style.cssText = "margin-top:20px";
+      cwrap.innerHTML = `<div class="section-title">Un mot pour la logistique</div>` + commentCardHtml("livraison");
+      app.querySelector("main").appendChild(cwrap);
+      wireCommentCard(p, p.statut === "recupere" ? "récupération" : "livraison");
+    }
+
+    // Archivage — quand la prestation est terminée (récupérée / livrée / close), ou pour désarchiver
+    const terminal = ["recupere", "livre", "clos"].includes(p.statut);
+    if (terminal || p.archivee) {
+      const arch = document.createElement("button");
+      arch.className = "btn sec block";
+      arch.style.cssText = "margin-top:24px";
+      arch.textContent = p.archivee ? "↩︎ Désarchiver la prestation" : "🗄 Archiver la prestation";
+      arch.onclick = async () => {
+        arch.disabled = true;
+        const { error } = await sb.from("prestations").update({ archivee: !p.archivee }).eq("id", id);
+        if (error) { arch.disabled = false; return toast(error.message, "err"); }
+        toast(p.archivee ? "Prestation désarchivée ✔" : "Prestation archivée ✔", "ok");
+        go(p.archivee ? "prestation/" + id : "prestations");
+      };
+      app.querySelector("main").appendChild(arch);
+    }
+
     // Modification de la prestation — réservé aux admins
     if (isAdmin()) {
       const edit = document.createElement("button");
@@ -664,6 +706,8 @@
           <button class="btn sec block" id="cp-add">＋ Déclarer une casse / perte</button>
         </div>` : ""}
 
+        ${sens === "retour" ? `<div class="section-title">Un mot pour la logistique</div>${commentCardHtml("récupération")}` : ""}
+
         <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
           <div class="row between" style="margin-bottom:8px">
             <b id="recap">0 pièce(s) ${verb}</b>
@@ -671,6 +715,7 @@
           <button class="btn ${sens==="sortie"?"":"sec"} block" id="valider">Valider ${label.toLowerCase()}</button>
         </div>
       </main>`;
+    if (sens === "retour") wireCommentCard(p, "récupération");
 
     // --- déclaration des casses/pertes (retour uniquement) ---
     const cpAdd = $("#cp-add");
@@ -932,11 +977,15 @@
              <button class="btn sec block" id="tout" style="margin-bottom:10px">✅ Tout récupéré, rien à signaler</button>
              ${lignes.map(line).join("")}`}
 
+        <div class="section-title">Un mot pour la logistique</div>
+        ${commentCardHtml("récupération")}
+
         <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
           <div class="row between" style="margin-bottom:8px"><b id="recap-rec">À facturer : 0,00 €</b></div>
           <button class="btn block" id="valider">Valider la récupération</button>
         </div>
       </main>`;
+    wireCommentCard(p, "récupération");
 
     const cards = () => $$("[data-rec]");
     const readCard = (el) => {
@@ -1930,6 +1979,96 @@ Total : ${eur(total)} HT`;
       "&body=" + encodeURIComponent(body);
     window.location.href = url;
   }
+
+  // =========================================================================
+  //  Commentaire livreur -> logistique (via edge function Brevo)
+  // =========================================================================
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).split(",")[1] || ""); // enlève le préfixe data:
+      r.onerror = () => reject(new Error("lecture image échouée"));
+      r.readAsDataURL(blob);
+    });
+  }
+
+  // Carte HTML réutilisable : texte + photo optionnelle
+  function commentCardHtml(placeholderCtx) {
+    const ph = placeholderCtx === "récupération"
+      ? "Un mot pour la logistique (matériel non rendu, souci au débarrassage, retard…)"
+      : "Un mot pour la logistique (accès, contact sur place, matériel, retard…)";
+    return `<div class="card" id="cm-card">
+      <textarea id="cm-text" placeholder="${esc(ph)}"></textarea>
+      <input id="cm-photo" type="file" accept="image/*" capture="environment" style="display:none" />
+      <input id="cm-photo-gal" type="file" accept="image/*" style="display:none" />
+      <div id="cm-photo-name" class="sub" style="margin-top:4px"></div>
+      <div class="btn-grid" style="margin-top:8px">
+        <button type="button" class="btn sec" id="cm-photo-btn">📷 Photo</button>
+        <button type="button" class="btn sec" id="cm-photo-gal-btn">🖼️ Galerie</button>
+      </div>
+      <button type="button" class="btn block" id="cm-send" style="margin-top:8px">✉️ Envoyer à la logistique</button>
+    </div>`;
+  }
+
+  // Branche les boutons de la carte commentaire (photo + envoi)
+  function wireCommentCard(p, etape) {
+    const camIn = $("#cm-photo"), galIn = $("#cm-photo-gal");
+    const nameEl = $("#cm-photo-name");
+    let photoBlob = null;
+    const pick = async (input) => {
+      const f = input.files && input.files[0];
+      if (!f) return;
+      try {
+        photoBlob = await resizeImage(f, 1400, 0.8);
+        if (nameEl) nameEl.textContent = "📎 Photo jointe (" + Math.round(photoBlob.size / 1024) + " Ko) — appuie sur Envoyer";
+      } catch (e) { toast("Photo illisible", "err"); }
+    };
+    if ($("#cm-photo-btn")) $("#cm-photo-btn").onclick = () => camIn.click();
+    if ($("#cm-photo-gal-btn")) $("#cm-photo-gal-btn").onclick = () => galIn.click();
+    camIn.onchange = () => pick(camIn);
+    galIn.onchange = () => pick(galIn);
+
+    $("#cm-send").onclick = async () => {
+      const text = $("#cm-text").value.trim();
+      if (!text && !photoBlob) return toast("Écris un commentaire ou joins une photo", "err");
+      const btn = $("#cm-send");
+      btn.disabled = true; btn.textContent = "⏳ Envoi…";
+      try {
+        let photo_base64 = null;
+        if (photoBlob) photo_base64 = await blobToBase64(photoBlob);
+        const { data: sess } = await sb.auth.getSession();
+        const token = sess && sess.session ? sess.session.access_token : "";
+        const res = await fetch(CFG.SUPABASE_URL + "/functions/v1/send-comment", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + token,
+            "apikey": CFG.SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            prestation_id: p.id,
+            prestation_lib: p.libelle || p.reference || "Prestation",
+            client_nom: p.clients ? p.clients.nom : "",
+            date_presta: p.date_presta || "",
+            livreur_nom: (state.profile && state.profile.nom) || state.user.email,
+            livreur_email: state.user.email,
+            etape,
+            commentaire: text,
+            photo_base64,
+          }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok || out.error) throw new Error(out.error || ("HTTP " + res.status));
+        toast("Commentaire envoyé à la logistique ✔", "ok");
+        $("#cm-text").value = ""; photoBlob = null;
+        if (nameEl) nameEl.textContent = "";
+        btn.disabled = false; btn.textContent = "✉️ Envoyer à la logistique";
+      } catch (e) {
+        btn.disabled = false; btn.textContent = "✉️ Réessayer l'envoi";
+        toast("Envoi impossible : " + (e.message || e), "err");
+      }
+    };
+  }
   const clientBadge = (t) =>
     t === "fixe" ? '<span class="badge blue">Fixe</span>' : '<span class="badge gray">Ponctuel</span>';
 
@@ -2043,6 +2182,7 @@ Total : ${eur(total)} HT`;
             </div>`}
 
         ${solde.length ? `
+          <button class="btn sec block" id="retard">📦 Enregistrer un retour tardif</button>
           <button class="btn block" id="recap">✉️ ${fixe ? "Envoyer le récap au client" : "Envoyer les manquants à la compta"}</button>
           <button class="btn warn block" id="facturer">💶 Facturer ce matériel (perte/casse)</button>
         ` : ""}
@@ -2058,6 +2198,8 @@ Total : ${eur(total)} HT`;
 
     $("#tb-action").onclick = () => go("client/" + id + "/edit");
     $("#edit").onclick = () => go("client/" + id + "/edit");
+    const retardBtn = $("#retard");
+    if (retardBtn) retardBtn.onclick = () => go("client/" + id + "/retard");
 
     // suppression en deux temps (pas de pop-up bloquant)
     let armed = false;
@@ -2138,6 +2280,92 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
       const { error } = await sb.from("facturations").insert(rows);
       factBtn.disabled = false;
       toast(error ? error.message : `${rows.length} ligne(s) ajoutée(s) à facturer ✔`, error ? "err" : "ok");
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Retour tardif — matériel rendu après coup, diminue le solde détenu
+  //  sans toucher au statut des prestations ni à la facturation.
+  // =========================================================================
+  async function viewRetardClient(id) {
+    const c = await db.client(id);
+    const solde = (await db.soldeClient(id)).filter((x) => x.solde > 0).sort((a, b) => b.solde - a.solde);
+
+    app.innerHTML =
+      topbar("Retour tardif · " + c.nom, { back: "client/" + id }) +
+      `<main>
+        ${solde.length === 0
+          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Ce client ne détient plus aucun matériel.</div>`
+          : `<div class="sub" style="margin-bottom:10px">Le client rend du matériel qui n'avait pas été repris lors d'une précédente livraison. Indique les quantités rendues : le <b>matériel détenu</b> diminue d'autant, sans changer le statut des prestations ni la facturation.</div>
+             ${solde.map((x) => `
+               <div class="card" data-ret="${x.type_id}" data-max="${x.solde}" data-nom="${esc(x.type_nom)}">
+                 <div class="row between"><b>${esc(x.type_nom)}</b><span class="badge amber">détenu ${x.solde}</span></div>
+                 <div class="field-row" style="margin-top:8px">
+                   <div><label style="margin-top:0">Rendu maintenant</label><input class="ret-in" type="number" inputmode="numeric" value="0" min="0" max="${x.solde}" /></div>
+                   <div style="display:flex;align-items:flex-end"><button type="button" class="btn sm sec ret-all" style="width:100%">Tout (${x.solde})</button></div>
+                 </div>
+               </div>`).join("")}
+             <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
+               <div class="row between" style="margin-bottom:8px"><b id="ret-recap">0 pièce(s) à enregistrer</b></div>
+               <button class="btn block" id="ret-save">Enregistrer le retour</button>
+             </div>`}
+      </main>`;
+
+    if (!solde.length) return;
+
+    const cards = () => $$("[data-ret]");
+    const clamp = (el) => Math.max(0, Math.min(parseInt(el.dataset.max), parseInt(el.querySelector(".ret-in").value) || 0));
+    const refresh = () => {
+      let n = 0;
+      cards().forEach((el) => (n += clamp(el)));
+      $("#ret-recap").textContent = `${n} pièce(s) à enregistrer`;
+    };
+    app.querySelector("main").addEventListener("input", (e) => {
+      if (!e.target.classList.contains("ret-in")) return;
+      const el = e.target.closest("[data-ret]");
+      const max = parseInt(el.dataset.max);
+      let v = Math.max(0, Math.min(max, parseInt(e.target.value) || 0));
+      e.target.value = v;
+      refresh();
+    });
+    $$(".ret-all").forEach((b) => b.onclick = () => {
+      const el = b.closest("[data-ret]");
+      el.querySelector(".ret-in").value = el.dataset.max;
+      refresh();
+    });
+    refresh();
+
+    $("#ret-save").onclick = async () => {
+      const wanted = {};
+      cards().forEach((el) => { const v = clamp(el); if (v > 0) wanted[el.dataset.ret] = v; });
+      const typeIds = Object.keys(wanted);
+      if (!typeIds.length) return toast("Indique au moins une quantité rendue", "err");
+      $("#ret-save").disabled = true;
+
+      // Impute les retours sur les prestations du client qui ont encore du manquant,
+      // des plus anciennes aux plus récentes (FIFO) — sans toucher statut/facturation.
+      const prestas = (await db.prestationsByClient(id)).slice()
+        .sort((a, b) => (a.date_presta || "") < (b.date_presta || "") ? -1 : (a.date_presta || "") > (b.date_presta || "") ? 1 : 0);
+      const bilans = await Promise.all(prestas.map((p) => db.bilan(p.id)));
+      const mvts = [];
+      typeIds.forEach((tid) => {
+        let rem = wanted[tid];
+        for (let i = 0; i < prestas.length && rem > 0; i++) {
+          const b = (bilans[i] || []).find((x) => x.type_id === tid);
+          const out = b ? b.q_manquant : 0;
+          if (out > 0) {
+            const take = Math.min(out, rem);
+            mvts.push({ prestation_id: prestas[i].id, sens: "retour", type_id: tid, unit_id: null, quantite: take, par_user: state.user.id });
+            rem -= take;
+          }
+        }
+      });
+      if (!mvts.length) { $("#ret-save").disabled = false; return toast("Rien à imputer — le solde est déjà à jour.", "err"); }
+      const { error } = await sb.from("mouvements").insert(mvts);
+      $("#ret-save").disabled = false;
+      if (error) return toast(error.message, "err");
+      toast("Retour tardif enregistré ✔", "ok");
+      go("client/" + id);
     };
   }
 
@@ -2260,7 +2488,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.1</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.2</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
