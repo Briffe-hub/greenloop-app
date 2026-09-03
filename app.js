@@ -34,6 +34,19 @@
     await sb.from("materiel_types").update({ stock_total: total }).eq("id", typeId);
     return total;
   }
+  // Archive automatiquement une prestation terminée s'il n'y a rien à facturer
+  // (aucune casse/perte/manquant en attente). Renvoie true si archivée.
+  async function maybeAutoArchive(id) {
+    const { count } = await sb.from("facturations")
+      .select("id", { count: "exact", head: true })
+      .eq("prestation_id", id).eq("statut", "a_facturer");
+    if ((count || 0) === 0) {
+      await sb.from("prestations").update({ archivee: true }).eq("id", id);
+      return true;
+    }
+    return false;
+  }
+
   // Date+heure courtes
   const dfrt = (iso) => {
     try { return new Date(iso).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "2-digit", hour: "2-digit", minute: "2-digit" }); }
@@ -131,6 +144,8 @@
       ).then((rows) => rows),
     bilan: (pid) => db.q("v_bilan_manquants", (q) => q.eq("prestation_id", pid)),
     facturations: (pid) => db.q("facturations", (q) => q.eq("prestation_id", pid).order("created_at")),
+    facturationsOpen: () => db.q("facturations", (q) => q.eq("statut", "a_facturer").not("prestation_id", "is", null)),
+    prestationsTerminees: () => db.q("prestations", (q) => q.in("statut", ["recupere", "livre"]).eq("archivee", false)),
   };
 
   // =========================================================================
@@ -164,6 +179,7 @@
       }
       if (head === "nouvelle-presta") return viewPrestaForm();
       if (head === "materiel" && parts.length === 1) return viewMateriel();
+      if (head === "ecarts") return viewEcarts();
       if (head === "archives") return viewArchives();
       if (head === "categories") return viewCategories();
       if (head === "tags") return viewTags();
@@ -294,6 +310,11 @@
     const cli = {};
     (await db.clients()).forEach((c) => (cli[c.id] = c));
 
+    // Écarts à traiter : terminées, non archivées, avec du matériel à facturer
+    const opens = await db.facturationsOpen();
+    const ecartIds = new Set(opens.map((f) => f.prestation_id));
+    const nEcarts = list.filter((p) => ["recupere", "livre"].includes(p.statut) && ecartIds.has(p.id)).length;
+
     const isAO = (p) => (cli[p.client_id] && cli[p.client_id].categorie || "").toLowerCase().includes("appel");
     const typeOf = (p) => cli[p.client_id] ? cli[p.client_id].type_client : null;
     const counts = {
@@ -318,6 +339,7 @@
     app.innerHTML =
       topbar("Prestations") +
       `<main>
+        ${nEcarts ? `<button class="btn warn block" style="margin-bottom:12px" onclick="location.hash='#/ecarts'">⚠️ Écarts à traiter (${nEcarts})</button>` : ""}
         <div class="seg" id="pfilter">
           <button data-f="tout" class="active">Tout (${counts.tout})</button>
           <button data-f="fixe">Fixes (${counts.fixe})</button>
@@ -377,6 +399,55 @@
         box.innerHTML = archived.slice().sort(byDate).map(card).join("");
       }
     };
+  }
+
+  // =========================================================================
+  //  VUE : Écarts à traiter (terminées non archivées avec du à-facturer)
+  // =========================================================================
+  async function viewEcarts() {
+    const [prestas, opens, clientsArr, typesArr] = await Promise.all([
+      db.prestationsTerminees(), db.facturationsOpen(), db.clients(), db.types(),
+    ]);
+    const cli = {}; clientsArr.forEach((c) => (cli[c.id] = c));
+    const tname = {}; typesArr.forEach((t) => (tname[t.id] = t.nom));
+    const openByP = {};
+    opens.forEach((f) => ((openByP[f.prestation_id] ||= []).push(f)));
+    const list = prestas.filter((p) => openByP[p.id] && openByP[p.id].length)
+      .sort((a, b) => (a.date_presta || "") < (b.date_presta || "") ? -1 : (a.date_presta || "") > (b.date_presta || "") ? 1 : 0);
+    const amount = (f) => Number(f.montant != null ? f.montant : (f.quantite * f.prix_unitaire)) || 0;
+
+    const card = (p) => {
+      const fs = openByP[p.id];
+      const total = fs.reduce((s, f) => s + amount(f), 0);
+      return `<div class="card">
+        <div class="row between">
+          <div class="grow"><b>${esc(p.libelle || p.reference || "Prestation")}</b>
+            <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}</div></div>
+          <span class="badge red">${eur(total)}</span>
+        </div>
+        <div class="sub" style="margin-top:6px">${fs.map((f) => `${f.quantite}× ${esc(tname[f.type_id] || "Matériel")} · ${esc(f.motif)}`).join("<br>")}</div>
+        <div class="btn-grid" style="margin-top:10px">
+          <button class="btn sec" onclick="location.hash='#/prestation/${p.id}/manquants'">📊 Détail</button>
+          <button class="btn" data-arch="${p.id}">✅ Traité — archiver</button>
+        </div>
+      </div>`;
+    };
+
+    app.innerHTML =
+      topbar("Écarts à traiter", { back: "prestations" }) +
+      `<main>
+        ${list.length
+          ? `<div class="sub" style="margin-bottom:8px">Prestations terminées avec du matériel à facturer (casse, perte, non rendu). Règle chacune (facturation au client), puis archive-la — elle sortira de cette liste.</div>${list.map(card).join("")}`
+          : `<div class="empty"><div class="big">✅</div>Aucun écart en attente. Tout est soldé.</div>`}
+      </main>`;
+
+    $$("[data-arch]").forEach((b) => b.onclick = async () => {
+      b.disabled = true;
+      const { error } = await sb.from("prestations").update({ archivee: true }).eq("id", b.dataset.arch);
+      if (error) { b.disabled = false; return toast(error.message, "err"); }
+      toast("Écart traité — prestation archivée ✔", "ok");
+      render();
+    });
   }
 
   // =========================================================================
@@ -898,10 +969,13 @@
       }
       const stErr = (await sb.from("prestations").update({ statut: nextStatut }).eq("id", id)).error;
       if (stErr) { $("#valider").disabled = false; return toast("Statut : " + stErr.message, "err"); }
+      // Auto-archivage du retour soldé sans rien à facturer
+      let archivedRetour = false;
+      if (sens === "retour" && nextStatut === "recupere") archivedRetour = await maybeAutoArchive(id);
       stopScanner();
       const msg = sens === "sortie"
         ? (totalSaisi > 0 ? `Sortie enregistrée (${totalSaisi} pièce(s)) ✔` : "Sortie annulée ✔")
-        : (facts.length ? `Retour + ${facts.length} à facturer ✔` : "Retour enregistré ✔");
+        : (facts.length ? `Retour + ${facts.length} à facturer → « Écarts à traiter » ✔` : (archivedRetour ? "Retour soldé — prestation archivée ✔" : "Retour enregistré ✔"));
       toast(msg, "ok");
       go("prestation/" + id);
     };
@@ -1048,6 +1122,8 @@
         if (error) { $("#valider").disabled = false; return toast("Récup ok mais facturation : " + error.message, "err"); }
       }
       await sb.from("prestations").update({ statut: "recupere" }).eq("id", id);
+      // Auto-archivage si rien à facturer ; sinon la prestation reste dans « Écarts à traiter »
+      const archived = await maybeAutoArchive(id);
 
       // Email au service compta si des manquants
       if (manquantsTxt.length) {
@@ -1064,9 +1140,9 @@ ${manquantsTxt.join("\n")}
 
 Total : ${eur(total)} HT`;
         if (compta) openMail(compta, `Matériel à facturer — ${cli} (${p.libelle || ""})`, body);
-        else toast("Récup enregistrée. Renseigne l'email compta dans Paramètres pour l'envoi auto.", "ok");
+        else toast("Écart enregistré → onglet « Écarts à traiter ».", "ok");
       } else {
-        toast("Récupération complète ✔", "ok");
+        toast(archived ? "Récupération soldée — prestation archivée ✔" : "Récupération complète ✔", "ok");
       }
       go("prestation/" + id);
     };
@@ -2488,7 +2564,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.2</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.3</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
