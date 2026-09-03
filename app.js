@@ -2176,7 +2176,12 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
           <datalist id="titulaire-list"><option value="Briffe"></option><option value="La consignerie"></option></datalist>
           <datalist id="cat-list"></datalist>
           <label>ID Sextan (optionnel)</label><input id="c-sextan" value="${esc(c.sextan_id || "")}" />
-          <button class="btn block" id="save">${isNew ? "Créer" : "Enregistrer"}</button>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:12px">
+            <input type="checkbox" id="c-syncexcl" ${c.sync_exclure ? "checked" : ""} style="width:20px;height:20px" />
+            Exclure de la synchro Sextan
+          </label>
+          <div class="sub" style="margin-top:2px">Coché : les événements Sextan de ce client ne sont PAS importés (ex. La consignerie, dont les appels d'offre passent par briffetools).</div>
+          <button class="btn block" id="save" style="margin-top:12px">${isNew ? "Créer" : "Enregistrer"}</button>
         </div>
       </main>`;
 
@@ -2204,6 +2209,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         groupe: $("#c-groupe").value.trim() || null,
         titulaire: $("#c-titulaire").value.trim() || null,
         sextan_id: $("#c-sextan").value.trim() || null,
+        sync_exclure: $("#c-syncexcl").checked,
         sextan_auto: false, // enregistrer une fiche = validée (sort de la liste « à valider »)
       };
       $("#save").disabled = true;
