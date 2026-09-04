@@ -1466,10 +1466,13 @@ Total : ${eur(total)} HT`;
     const [types, cats, tags] = await Promise.all([db.types(), db.categories(), db.tags()]);
     const inCss = "width:100%;padding:6px 7px;font-size:13px;border:1px solid var(--line);border-radius:8px;background:#fff";
     const catOptions = (sel) => `<option value="">—</option>` + cats.map((c) => `<option ${c.nom === sel ? "selected" : ""}>${esc(c.nom)}</option>`).join("");
+    const thumb = (t) => t.photo_url
+      ? `<img src="${esc(t.photo_url)}" alt="" style="width:32px;height:32px;border-radius:7px;object-fit:cover;flex:0 0 auto;background:#eef0ee" />`
+      : `<div style="width:32px;height:32px;border-radius:7px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:15px">📦</div>`;
     const rowHtml = (t) => {
       const tg = t.tags || [];
       return `<tr data-id="${t.id || ""}">
-        <td style="position:sticky;left:0;background:#fff;padding:5px;min-width:150px;box-shadow:1px 0 0 var(--line)"><input class="m-nom" value="${esc(t.nom || "")}" placeholder="Nom" style="${inCss}" /></td>
+        <td style="position:sticky;left:0;background:#fff;padding:5px;min-width:180px;box-shadow:1px 0 0 var(--line)"><div style="display:flex;align-items:center;gap:6px">${thumb(t)}<input class="m-nom" value="${esc(t.nom || "")}" placeholder="Nom" style="${inCss}" /></div></td>
         <td style="padding:5px"><select class="m-cat" style="${inCss};min-width:120px">${catOptions(t.categorie)}</select></td>
         <td style="padding:5px"><input class="m-prix" type="number" step="0.01" value="${t.prix_unitaire || 0}" style="${inCss};width:78px" /></td>
         <td style="padding:5px"><input class="m-code" value="${esc(t.code_qr || "")}" placeholder="auto" style="${inCss};width:120px;font-family:monospace" /></td>
@@ -2827,7 +2830,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.9</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.0</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
