@@ -612,7 +612,9 @@
     } else if (p.statut === "recupere" || p.statut === "livre") {
       wf.innerHTML =
         `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div><b>Prestation ${STATUT_LABEL[p.statut].toLowerCase()}.</b>
-          ${totalManq ? `<div class="sub" style="margin-top:6px">${totalManq} pièce(s) non restituée(s) — voir la fiche client pour la facturation.</div>` : `<div class="sub" style="margin-top:6px">Tout est réglé.</div>`}</div>`;
+          ${totalManq ? `<div class="sub" style="margin-top:6px">${totalManq} pièce(s) non restituée(s) — voir la fiche client pour la facturation.</div>` : `<div class="sub" style="margin-top:6px">Tout est réglé.</div>`}</div>` +
+        bigBtn("✏️ Corriger la récupération", "Modifier le pointage si un livreur s'est trompé", "sec",
+          fixe ? `location.hash='#/prestation/${id}/retour'` : `location.hash='#/prestation/${id}/recuperation'`);
     }
 
     // Accès discret pour corriger une étape si besoin (insertAdjacentHTML pour ne pas
@@ -969,9 +971,12 @@
       }
       const stErr = (await sb.from("prestations").update({ statut: nextStatut }).eq("id", id)).error;
       if (stErr) { $("#valider").disabled = false; return toast("Statut : " + stErr.message, "err"); }
-      // Auto-archivage du retour soldé sans rien à facturer
+      // Auto-archivage du retour soldé sans rien à facturer ; sinon on la ré-affiche dans « Écarts »
       let archivedRetour = false;
-      if (sens === "retour" && nextStatut === "recupere") archivedRetour = await maybeAutoArchive(id);
+      if (sens === "retour" && nextStatut === "recupere") {
+        archivedRetour = await maybeAutoArchive(id);
+        if (!archivedRetour) await sb.from("prestations").update({ archivee: false }).eq("id", id);
+      }
       stopScanner();
       const msg = sens === "sortie"
         ? (totalSaisi > 0 ? `Sortie enregistrée (${totalSaisi} pièce(s)) ✔` : "Sortie annulée ✔")
@@ -1030,24 +1035,37 @@
   async function viewRecuperation(id) {
     const p = await db.prestation(id);
     const bilan = await db.bilan(id);
-    const lignes = bilan.filter((b) => b.q_manquant > 0); // reste à récupérer
+    // On se base sur ce qui est SORTI (pas sur le reste à récupérer) : l'écran reste
+    // donc modifiable même après validation, pour corriger une erreur de pointage.
+    const lignes = bilan.filter((b) => b.q_sortie > 0);
+    // Pertes déjà déclarées (pour pré-remplir « non récupéré » en mode correction)
+    const factRes = await sb.from("facturations").select("type_id,quantite")
+      .eq("prestation_id", id).eq("statut", "a_facturer").eq("motif", "perte");
+    const perteByType = {};
+    (factRes.data || []).forEach((f) => (perteByType[f.type_id] = (perteByType[f.type_id] || 0) + f.quantite));
+    const dejaValide = p.statut === "recupere" || p.statut === "livre";
 
-    const line = (b) => `
-      <div class="card" data-rec="${b.type_id}" data-exp="${b.q_manquant}" data-prix="${b.prix_unitaire}" data-nom="${esc(b.type_nom)}">
-        <div class="row between"><b>${esc(b.type_nom)}</b><span class="badge gray">Attendu ${b.q_manquant}</span></div>
+    const line = (b) => {
+      const exp = b.q_sortie;
+      const nonrec = Math.min(exp, perteByType[b.type_id] || 0);
+      const rec = exp - nonrec;
+      return `
+      <div class="card" data-rec="${b.type_id}" data-exp="${exp}" data-prix="${b.prix_unitaire}" data-nom="${esc(b.type_nom)}">
+        <div class="row between"><b>${esc(b.type_nom)}</b><span class="badge gray">Sortis ${exp}</span></div>
         <div class="field-row" style="margin-top:8px">
-          <div><label style="margin-top:0">Récupéré</label><input class="rec-in" type="number" inputmode="numeric" value="${b.q_manquant}" min="0" max="${b.q_manquant}" /></div>
-          <div><label style="margin-top:0">Non récupéré</label><input class="nonrec-in" type="number" inputmode="numeric" value="0" min="0" max="${b.q_manquant}" /></div>
+          <div><label style="margin-top:0">Récupéré</label><input class="rec-in" type="number" inputmode="numeric" value="${rec}" min="0" max="${exp}" /></div>
+          <div><label style="margin-top:0">Non récupéré</label><input class="nonrec-in" type="number" inputmode="numeric" value="${nonrec}" min="0" max="${exp}" /></div>
         </div>
         <div class="sub perte-lbl" style="margin-top:6px"></div>
       </div>`;
+    };
 
     app.innerHTML =
-      topbar("Récupération · " + (p.libelle || ""), { back: "prestation/" + id }) +
+      topbar((dejaValide ? "Corriger récup · " : "Récupération · ") + (p.libelle || ""), { back: "prestation/" + id }) +
       `<main>
         ${lignes.length === 0
-          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Rien à récupérer sur cette prestation.</div>`
-          : `<div class="sub" style="margin-bottom:8px">Pointe chaque ligne : par défaut tout est récupéré. Indique le nombre « Non récupéré » le cas échéant — il sera facturé au client.</div>
+          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Rien n'a été sorti sur cette prestation.</div>`
+          : `<div class="sub" style="margin-bottom:8px">${dejaValide ? "<b>Correction :</b> ajuste les quantités si un livreur s'est trompé, puis revalide. " : ""}Pointe chaque ligne : par défaut tout est récupéré. Indique le nombre « Non récupéré » le cas échéant — il sera facturé au client.</div>
              <button class="btn sec block" id="tout" style="margin-bottom:10px">✅ Tout récupéré, rien à signaler</button>
              ${lignes.map(line).join("")}`}
 
@@ -1113,6 +1131,15 @@
         }
       });
       $("#valider").disabled = true;
+
+      // REMPLACEMENT idempotent : on efface d'abord les retours et les pertes déjà
+      // enregistrés pour cette prestation, puis on réécrit — c'est ce qui permet de
+      // corriger une récupération déjà validée sans doubler les quantités.
+      const delMvt = await sb.from("mouvements").delete().eq("prestation_id", id).eq("sens", "retour");
+      if (delMvt.error) { $("#valider").disabled = false; return toast(delMvt.error.message, "err"); }
+      const delF = await sb.from("facturations").delete().eq("prestation_id", id).eq("statut", "a_facturer").eq("motif", "perte");
+      if (delF.error) { $("#valider").disabled = false; return toast(delF.error.message, "err"); }
+
       if (mvts.length) {
         const { error } = await sb.from("mouvements").insert(mvts);
         if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
@@ -1122,8 +1149,9 @@
         if (error) { $("#valider").disabled = false; return toast("Récup ok mais facturation : " + error.message, "err"); }
       }
       await sb.from("prestations").update({ statut: "recupere" }).eq("id", id);
-      // Auto-archivage si rien à facturer ; sinon la prestation reste dans « Écarts à traiter »
+      // Auto-archivage si rien à facturer ; sinon on la ré-affiche dans « Écarts à traiter »
       const archived = await maybeAutoArchive(id);
+      if (!archived) await sb.from("prestations").update({ archivee: false }).eq("id", id);
 
       // Email au service compta si des manquants
       if (manquantsTxt.length) {
@@ -2564,7 +2592,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.3</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.4</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
