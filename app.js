@@ -1481,7 +1481,11 @@ Total : ${eur(total)} HT`;
       topbar("Édition en masse", { back: "materiel" }) +
       `<main>
         <div class="sub" style="margin-bottom:8px">Modifie tout d'un coup : nom, catégorie, prix HT, code QR et tags (cases à cocher). Fais défiler vers la droite pour voir toutes les colonnes de tags. Le <b>parc</b> se règle sur la fiche (journal), pas ici.</div>
-        <div style="overflow:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:12px;max-height:calc(100vh - 260px)">
+        <div class="field-row" style="margin-bottom:10px">
+          <input id="mcat-new" placeholder="Nouvelle catégorie…" />
+          <button class="btn sm sec" id="mcat-add" style="flex:0 0 auto">＋ Catégorie</button>
+        </div>
+        <div style="overflow:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:12px;max-height:calc(100vh - 300px)">
           <table style="border-collapse:separate;border-spacing:0;font-size:13px;background:#fff;white-space:nowrap">
             <thead><tr>
               <th style="position:sticky;left:0;top:0;z-index:3;background:#e9ebe7;padding:8px;text-align:left;box-shadow:1px 0 0 var(--line),0 1px 0 var(--line)">Nom</th>
@@ -1504,6 +1508,25 @@ Total : ${eur(total)} HT`;
       const rows = $$("#masse-body tr");
       rows[rows.length - 1].querySelector(".m-nom").focus();
     };
+
+    // Ajout d'une catégorie à la volée (sans quitter l'écran ni perdre les modifs)
+    const catAdd = $("#mcat-add"), catInput = $("#mcat-new");
+    const addCat = async () => {
+      const nom = catInput.value.trim();
+      if (!nom) return;
+      if (cats.some((c) => _norm(c.nom) === _norm(nom))) { toast("Cette catégorie existe déjà", "err"); return; }
+      catAdd.disabled = true;
+      const { data, error } = await sb.from("materiel_categories").insert({ nom }).select().single();
+      catAdd.disabled = false;
+      if (error) return toast(error.message.includes("duplicate") ? "Cette catégorie existe déjà" : error.message, "err");
+      cats.push(data || { nom });
+      // ajoute l'option à toutes les listes déroulantes déjà affichées
+      $$("#masse-body .m-cat").forEach((sel) => sel.insertAdjacentHTML("beforeend", `<option>${esc(nom)}</option>`));
+      catInput.value = "";
+      toast(`Catégorie « ${nom} » ajoutée ✔`, "ok");
+    };
+    catAdd.onclick = addCat;
+    catInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); addCat(); } });
     $("#m-save").onclick = async () => {
       const rows = [];
       let bad = false;
@@ -2780,7 +2803,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.7</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.8</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
