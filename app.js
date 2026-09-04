@@ -339,10 +339,14 @@
     list.forEach((p) => tagsOf(p).forEach((t) => (tagCount[t] = (tagCount[t] || 0) + 1)));
     const presentTags = Object.keys(tagCount).sort();
 
+    const admin = isAdmin();          // sélection multiple réservée aux admins
+    const selected = new Set();
+
     const card = (p) => {
       const tg = tagsOf(p);
       return `
       <div class="card tap" onclick="location.hash='#/prestation/${p.id}'">
+        ${admin ? `<input type="checkbox" class="psel" data-id="${p.id}" onclick="event.stopPropagation()" style="width:22px;height:22px;flex:0 0 auto;margin-right:8px;align-self:center" />` : ""}
         <div class="grow">
           <div class="row between">
             <h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>
@@ -367,7 +371,12 @@
           <div class="sub">Par journée de livraison</div>
           <button class="btn sm sec" id="psort" style="width:auto">📅 Plus proches d'abord ↑</button>
         </div>
+        ${admin ? `<div class="sub" style="margin:0 2px 8px">☑︎ Coche des prestations pour les archiver en bloc.</div>` : ""}
         <div id="plist"></div>
+        ${admin ? `<div id="pbulk" class="hidden" style="position:sticky;bottom:calc(84px + var(--safe-b));background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;gap:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);margin-top:10px">
+          <button class="btn ghost" id="pbulk-cancel" style="flex:0 0 auto">Annuler</button>
+          <button class="btn" id="pbulk-arch" style="flex:1">🗄 Archiver (0)</button>
+        </div>` : ""}
       </main>
       <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
 
@@ -392,7 +401,35 @@
       $("#plist").innerHTML = l.length
         ? keys.map((k) => `<div class="section-title">${esc(dayLabel(k))} <span style="color:var(--muted);font-weight:600">· ${groups[k].length}</span></div>${groups[k].map(card).join("")}`).join("")
         : `<div class="empty"><div class="big">📋</div>Aucune prestation.</div>`;
+      if (admin) { selected.clear(); refreshBulk(); }   // les cases sont recréées -> on repart à zéro
     };
+
+    // --- Sélection multiple / archivage en bloc (admin) ---
+    function refreshBulk() {
+      const bar = $("#pbulk"), btn = $("#pbulk-arch");
+      if (!bar) return;
+      if (selected.size) { bar.classList.remove("hidden"); btn.textContent = `🗄 Archiver (${selected.size})`; }
+      else bar.classList.add("hidden");
+    }
+    if (admin) {
+      $("#plist").addEventListener("change", (e) => {
+        const c = e.target.closest(".psel"); if (!c) return;
+        c.checked ? selected.add(c.dataset.id) : selected.delete(c.dataset.id);
+        refreshBulk();
+      });
+      $("#pbulk-cancel").onclick = () => { selected.clear(); $$(".psel").forEach((c) => (c.checked = false)); refreshBulk(); };
+      $("#pbulk-arch").onclick = async () => {
+        const ids = [...selected];
+        if (!ids.length) return;
+        const btn = $("#pbulk-arch"); btn.disabled = true;
+        const { error } = await sb.from("prestations").update({ archivee: true }).in("id", ids);
+        btn.disabled = false;
+        if (error) return toast(error.message, "err");
+        toast(`${ids.length} prestation(s) archivée(s) ✔`, "ok");
+        render();
+      };
+    }
+
     const ptagf = $("#ptagf");
     if (ptagf) ptagf.addEventListener("click", (e) => {
       const b = e.target.closest(".ptag");
@@ -418,14 +455,18 @@
     const cli = {};
     (await db.clients()).forEach((c) => (cli[c.id] = c));
 
+    const selected = new Set();
     const card = (p) => `
       <div class="card" data-pid="${p.id}">
-        <div class="tap" onclick="location.hash='#/prestation/${p.id}'" style="display:flex;align-items:center;gap:10px">
-          <div class="grow">
-            <div class="row between"><h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>${prestaBadge(p.statut)}</div>
-            <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}</div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <input type="checkbox" class="asel" data-id="${p.id}" style="width:22px;height:22px;flex:0 0 auto" />
+          <div class="tap grow" onclick="location.hash='#/prestation/${p.id}'" style="display:flex;align-items:center;gap:10px">
+            <div class="grow">
+              <div class="row between"><h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>${prestaBadge(p.statut)}</div>
+              <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}</div>
+            </div>
+            <div style="font-size:22px;color:#cbd5c9">›</div>
           </div>
-          <div style="font-size:22px;color:#cbd5c9">›</div>
         </div>
         <button class="btn sm ghost" data-unarch="${p.id}" style="margin-top:8px;color:var(--green)">↩︎ Désarchiver</button>
       </div>`;
@@ -435,10 +476,14 @@
       `<main>
         <input id="asearch" placeholder="🔍 Rechercher (libellé, client, réf…)" style="margin-bottom:8px" />
         <div class="row between" style="margin:2px 2px 10px">
-          <div class="sub">${archived.length} archivée(s)</div>
+          <div class="sub">${archived.length} archivée(s) · ☑︎ coche pour désarchiver en bloc</div>
           <button class="btn sm sec" id="asort" style="width:auto">📅 Plus récentes d'abord ↓</button>
         </div>
         <div id="alist"></div>
+        <div id="abulk" class="hidden" style="position:sticky;bottom:calc(84px + var(--safe-b));background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;gap:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);margin-top:10px">
+          <button class="btn ghost" id="abulk-cancel" style="flex:0 0 auto">Annuler</button>
+          <button class="btn" id="abulk-un" style="flex:1">↩︎ Désarchiver (0)</button>
+        </div>
       </main>`;
 
     let q = "", sortAsc = false;
@@ -446,6 +491,12 @@
       const da = a.date_presta || "", db2 = b.date_presta || "";
       return (da < db2 ? -1 : da > db2 ? 1 : 0) * (sortAsc ? 1 : -1);
     };
+    function refreshBulk() {
+      const bar = $("#abulk"), btn = $("#abulk-un");
+      if (!bar) return;
+      if (selected.size) { bar.classList.remove("hidden"); btn.textContent = `↩︎ Désarchiver (${selected.size})`; }
+      else bar.classList.add("hidden");
+    }
     const draw = () => {
       let l = archived;
       if (q) l = l.filter((p) => [p.libelle, p.reference, cli[p.client_id] && cli[p.client_id].nom]
@@ -453,6 +504,7 @@
       l = l.slice().sort(byDate);
       $("#alist").innerHTML = l.length ? l.map(card).join("")
         : `<div class="empty"><div class="big">🗄</div>Aucune prestation archivée.</div>`;
+      selected.clear(); refreshBulk();
       $$("[data-unarch]").forEach((b) => b.onclick = async (e) => {
         e.stopPropagation();
         b.disabled = true;
@@ -460,6 +512,22 @@
         if (error) { b.disabled = false; return toast(error.message, "err"); }
         toast("Prestation désarchivée ✔", "ok"); render();
       });
+    };
+    $("#alist").addEventListener("change", (e) => {
+      const c = e.target.closest(".asel"); if (!c) return;
+      c.checked ? selected.add(c.dataset.id) : selected.delete(c.dataset.id);
+      refreshBulk();
+    });
+    $("#abulk-cancel").onclick = () => { selected.clear(); $$(".asel").forEach((c) => (c.checked = false)); refreshBulk(); };
+    $("#abulk-un").onclick = async () => {
+      const ids = [...selected];
+      if (!ids.length) return;
+      const btn = $("#abulk-un"); btn.disabled = true;
+      const { error } = await sb.from("prestations").update({ archivee: false }).in("id", ids);
+      btn.disabled = false;
+      if (error) return toast(error.message, "err");
+      toast(`${ids.length} prestation(s) désarchivée(s) ✔`, "ok");
+      render();
     };
     $("#asearch").addEventListener("input", (e) => { q = _norm(e.target.value.trim()); draw(); });
     $("#asort").onclick = () => {
@@ -1413,13 +1481,15 @@ Total : ${eur(total)} HT`;
       topbar("Édition en masse", { back: "materiel" }) +
       `<main>
         <div class="sub" style="margin-bottom:8px">Modifie tout d'un coup : nom, catégorie, prix HT, code QR et tags (cases à cocher). Fais défiler vers la droite pour voir toutes les colonnes de tags. Le <b>parc</b> se règle sur la fiche (journal), pas ici.</div>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:12px">
-          <table style="border-collapse:collapse;font-size:13px;background:#fff;white-space:nowrap">
-            <thead><tr style="background:#f3f4f6">
-              <th style="position:sticky;left:0;background:#f3f4f6;padding:8px;text-align:left;box-shadow:1px 0 0 var(--line)">Nom</th>
-              <th style="padding:8px">Catégorie</th><th style="padding:8px">Prix HT €</th><th style="padding:8px">Code QR</th>
-              ${tags.map((t) => `<th style="padding:8px">${esc(t.nom)}${t.is_base ? " ★" : ""}</th>`).join("")}
-              <th style="padding:8px">Actif</th>
+        <div style="overflow:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:12px;max-height:calc(100vh - 260px)">
+          <table style="border-collapse:separate;border-spacing:0;font-size:13px;background:#fff;white-space:nowrap">
+            <thead><tr>
+              <th style="position:sticky;left:0;top:0;z-index:3;background:#e9ebe7;padding:8px;text-align:left;box-shadow:1px 0 0 var(--line),0 1px 0 var(--line)">Nom</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Catégorie</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Prix HT €</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Code QR</th>
+              ${tags.map((t) => `<th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">${esc(t.nom)}${t.is_base ? " ★" : ""}</th>`).join("")}
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Actif</th>
             </tr></thead>
             <tbody id="masse-body">${types.map(rowHtml).join("")}</tbody>
           </table>
@@ -2710,7 +2780,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.5</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.7</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
