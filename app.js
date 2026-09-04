@@ -1463,7 +1463,8 @@ Total : ${eur(total)} HT`;
       app.innerHTML = topbar("Édition en masse") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
       return;
     }
-    const [types, cats, tags] = await Promise.all([db.types(), db.categories(), db.tags()]);
+    const [types, cats, tags, journalRows] = await Promise.all([db.types(), db.categories(), db.tags(), db.q("parc_journal")]);
+    const journaledIds = new Set((journalRows || []).map((j) => j.type_id)); // parc déjà initialisé -> verrouillé
     const inCss = "width:100%;padding:6px 7px;font-size:13px;border:1px solid var(--line);border-radius:8px;background:#fff";
     const catOptions = (sel) => `<option value="">—</option>` + cats.map((c) => `<option ${c.nom === sel ? "selected" : ""}>${esc(c.nom)}</option>`).join("");
     const thumb = (t) => t.photo_url
@@ -1476,6 +1477,11 @@ Total : ${eur(total)} HT`;
         <td style="padding:5px"><select class="m-cat" style="${inCss};min-width:120px">${catOptions(t.categorie)}</select></td>
         <td style="padding:5px"><input class="m-prix" type="number" step="0.01" value="${t.prix_unitaire || 0}" style="${inCss};width:78px" /></td>
         <td style="padding:5px"><input class="m-code" value="${esc(t.code_qr || "")}" placeholder="auto" style="${inCss};width:120px;font-family:monospace" /></td>
+        <td style="padding:5px">${(() => {
+          const locked = !!(t.id && journaledIds.has(t.id));
+          const st = t.stock_total || 0;
+          return `<input class="m-parc" type="number" step="1" value="${st}" data-locked="${locked ? 1 : 0}" data-stock="${st}" ${locked ? "readonly" : ""} title="${locked ? "Parc verrouillé — ajuste via le journal du matériel" : "Parc initial (verrouillé après enregistrement)"}" style="${inCss};width:72px${locked ? ";background:#f1f3f0" : ""}" />`;
+        })()}</td>
         ${tags.map((tag) => `<td style="text-align:center;padding:5px"><input type="checkbox" class="m-tag" data-tag="${esc(tag.nom)}" ${tg.includes(tag.nom) ? "checked" : ""} style="width:20px;height:20px" /></td>`).join("")}
         <td style="text-align:center;padding:5px"><input type="checkbox" class="m-actif" ${t.actif !== false ? "checked" : ""} style="width:20px;height:20px" /></td>
         <td style="text-align:center;padding:5px"><button type="button" class="m-del" title="Supprimer" style="border:none;background:none;color:var(--danger);font-size:16px;cursor:pointer;padding:4px 8px">🗑</button></td>
@@ -1484,7 +1490,7 @@ Total : ${eur(total)} HT`;
     app.innerHTML =
       topbar("Édition en masse", { back: "materiel" }) +
       `<main>
-        <div class="sub" style="margin-bottom:8px">Modifie tout d'un coup : nom, catégorie, prix HT, code QR et tags (cases à cocher). Fais défiler vers la droite pour voir toutes les colonnes de tags. Le <b>parc</b> se règle sur la fiche (journal), pas ici.</div>
+        <div class="sub" style="margin-bottom:8px">Modifie tout d'un coup : nom, catégorie, prix HT, code QR, parc initial et tags (cases à cocher). Fais défiler vers la droite pour voir toutes les colonnes. Le <b>parc</b> se saisit ici tant qu'il n'a jamais été initialisé (🔒 ensuite) ; après, il se corrige via le journal de la fiche.</div>
         <div class="field-row" style="margin-bottom:10px">
           <input id="mcat-new" placeholder="Nouvelle catégorie…" />
           <button class="btn sm sec" id="mcat-add" style="flex:0 0 auto">＋ Catégorie</button>
@@ -1496,6 +1502,7 @@ Total : ${eur(total)} HT`;
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Catégorie</th>
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Prix HT €</th>
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Code QR</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Parc</th>
               ${tags.map((t) => `<th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">${esc(t.nom)}${t.is_base ? " ★" : ""}</th>`).join("")}
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Actif</th>
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Suppr.</th>
@@ -1556,7 +1563,7 @@ Total : ${eur(total)} HT`;
     catInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); addCat(); } });
     $("#m-save").onclick = async () => {
       const rows = [];
-      let bad = false;
+      const toInit = []; // parcs à initialiser (journal motif "initial")
       $$("#masse-body tr").forEach((tr) => {
         const nom = tr.querySelector(".m-nom").value.trim();
         if (!nom) return; // ligne vide ignorée
@@ -1564,6 +1571,11 @@ Total : ${eur(total)} HT`;
         // toutes les lignes portent un id (clés uniformes = requis par l'upsert groupé) ;
         // une nouvelle ligne reçoit un id neuf -> insertion, une ligne existante -> mise à jour.
         const id = tr.dataset.id || (crypto.randomUUID ? crypto.randomUUID() : ("" + Date.now() + Math.random()));
+        // Parc : verrouillé -> on garde la valeur actuelle inchangée ; sinon on prend la saisie.
+        const pInput = tr.querySelector(".m-parc");
+        const pLocked = pInput.dataset.locked === "1";
+        const pVal = pLocked ? (parseInt(pInput.dataset.stock) || 0) : (parseInt(pInput.value) || 0);
+        if (!pLocked && pVal > 0) toInit.push({ id, delta: pVal });
         rows.push({
           id,
           nom,
@@ -1572,13 +1584,21 @@ Total : ${eur(total)} HT`;
           code_qr: code || slugCode(nom),
           tags: Array.from(tr.querySelectorAll(".m-tag")).filter((c) => c.checked).map((c) => c.dataset.tag),
           actif: tr.querySelector(".m-actif").checked,
+          stock_total: pVal,
         });
       });
       if (!rows.length) return toast("Rien à enregistrer", "err");
       $("#m-save").disabled = true;
       const { error } = await sb.from("materiel_types").upsert(rows, { onConflict: "id" });
+      if (error) { $("#m-save").disabled = false; return toast(error.message.includes("duplicate") || error.code === "23505" ? "Un code QR est en double — corrige-le" : error.message, "err"); }
+      // Inscrit la saisie initiale du parc au journal (verrouille pour la suite)
+      if (toInit.length) {
+        await sb.from("parc_journal").insert(toInit.map((x) => ({
+          type_id: x.id, delta: x.delta, motif: "initial",
+          commentaire: "Saisie initiale (édition en masse)", par_user: state.user.id,
+        })));
+      }
       $("#m-save").disabled = false;
-      if (error) return toast(error.message.includes("duplicate") || error.code === "23505" ? "Un code QR est en double — corrige-le" : error.message, "err");
       toast(`${rows.length} matériel(s) enregistré(s) ✔`, "ok");
       render();
     };
@@ -2830,7 +2850,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.0</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.1</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
