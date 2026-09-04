@@ -47,6 +47,17 @@
     return false;
   }
 
+  // Libellé de journée relatif (Aujourd'hui / Demain / Hier / date longue)
+  function dayLabel(iso) {
+    if (!iso || iso === "zzz") return "Sans date";
+    const d = new Date(iso + "T00:00:00");
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const diff = Math.round((d - today) / 86400000);
+    const full = d.toLocaleDateString("fr-FR", { weekday: "long", day: "2-digit", month: "short" });
+    const rel = diff === 0 ? "Aujourd'hui" : diff === 1 ? "Demain" : diff === -1 ? "Hier" : null;
+    return rel ? `${rel} · ${full}` : full;
+  }
+
   // Date+heure courtes
   const dfrt = (iso) => {
     try { return new Date(iso).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "2-digit", hour: "2-digit", minute: "2-digit" }); }
@@ -180,6 +191,7 @@
       if (head === "nouvelle-presta") return viewPrestaForm();
       if (head === "materiel" && parts.length === 1) return viewMateriel();
       if (head === "ecarts") return viewEcarts();
+      if (head === "archivees") return viewArchivesPresta();
       if (head === "archives") return viewArchives();
       if (head === "categories") return viewCategories();
       if (head === "tags") return viewTags();
@@ -305,80 +317,88 @@
   // =========================================================================
   async function viewPrestations() {
     const all = await db.prestations();
-    const list = all.filter((p) => !p.archivee);      // actives
-    const archived = all.filter((p) => p.archivee);   // archivées (masquées par défaut)
+    const list = all.filter((p) => !p.archivee);      // actives (les archivées ont leur écran dédié)
     const cli = {};
     (await db.clients()).forEach((c) => (cli[c.id] = c));
 
-    // Écarts à traiter : terminées, non archivées, avec du matériel à facturer
-    const opens = await db.facturationsOpen();
-    const ecartIds = new Set(opens.map((f) => f.prestation_id));
-    const nEcarts = list.filter((p) => ["recupere", "livre"].includes(p.statut) && ecartIds.has(p.id)).length;
+    // Packs (tags) par type de prestation Sextan -> filtre par tag
+    const map = await db.typeTagMap();
+    const mapOf = {}; map.forEach((m) => (mapOf[m.sextan_type] = m.tags || []));
+    const tagsOf = (p) => (p.type_presta && mapOf[p.type_presta]) ? mapOf[p.type_presta] : [];
 
-    const isAO = (p) => (cli[p.client_id] && cli[p.client_id].categorie || "").toLowerCase().includes("appel");
-    const typeOf = (p) => cli[p.client_id] ? cli[p.client_id].type_client : null;
-    const counts = {
-      tout: list.length,
-      fixe: list.filter((p) => typeOf(p) === "fixe").length,
-      ponctuel: list.filter((p) => typeOf(p) === "ponctuel").length,
-      ao: list.filter(isAO).length,
-    };
+    // Écarts à traiter : réservés aux admins
+    let nEcarts = 0;
+    if (isAdmin()) {
+      const opens = await db.facturationsOpen();
+      const ecartIds = new Set(opens.map((f) => f.prestation_id));
+      nEcarts = list.filter((p) => ["recupere", "livre"].includes(p.statut) && ecartIds.has(p.id)).length;
+    }
 
-    const card = (p) => `
+    // Tags réellement présents parmi les prestations actives
+    const tagCount = {};
+    list.forEach((p) => tagsOf(p).forEach((t) => (tagCount[t] = (tagCount[t] || 0) + 1)));
+    const presentTags = Object.keys(tagCount).sort();
+
+    const card = (p) => {
+      const tg = tagsOf(p);
+      return `
       <div class="card tap" onclick="location.hash='#/prestation/${p.id}'">
         <div class="grow">
           <div class="row between">
             <h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>
             ${prestaBadge(p.statut)}
           </div>
-          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}${p.source === "sextan" ? ` · <span class="badge blue" style="font-size:10px;padding:1px 6px">Sextan</span>` : ""}</div>
+          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")}${p.source === "sextan" ? ` · <span class="badge blue" style="font-size:10px;padding:1px 6px">Sextan</span>` : ""}</div>
+          ${tg.length ? `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:5px">${tg.map((t) => `<span class="badge green" style="font-size:10px;padding:1px 7px">${esc(t)}</span>`).join("")}</div>` : ""}
         </div>
         <div style="font-size:22px;color:#cbd5c9">›</div>
       </div>`;
+    };
 
     app.innerHTML =
-      topbar("Prestations") +
+      topbar("Prestations", { action: "🗄 Archives" }) +
       `<main>
         ${nEcarts ? `<button class="btn warn block" style="margin-bottom:12px" onclick="location.hash='#/ecarts'">⚠️ Écarts à traiter (${nEcarts})</button>` : ""}
-        <div class="seg" id="pfilter">
-          <button data-f="tout" class="active">Tout (${counts.tout})</button>
-          <button data-f="fixe">Fixes (${counts.fixe})</button>
-          <button data-f="ponctuel">Ponctuels (${counts.ponctuel})</button>
-          <button data-f="ao">Appels d'offre (${counts.ao})</button>
-        </div>
+        ${presentTags.length ? `<div id="ptagf" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+          <button type="button" class="ptag" data-tag="" style="${chipCss(true)}">Tout (${list.length})</button>
+          ${presentTags.map((t) => `<button type="button" class="ptag" data-tag="${esc(t)}" style="${chipCss(false)}">${esc(t)} (${tagCount[t]})</button>`).join("")}
+        </div>` : ""}
         <div class="row between" style="margin:2px 2px 10px">
-          <div class="sub">Triées par date de livraison</div>
+          <div class="sub">Par journée de livraison</div>
           <button class="btn sm sec" id="psort" style="width:auto">📅 Plus proches d'abord ↑</button>
         </div>
         <div id="plist"></div>
-        ${archived.length ? `<button class="btn ghost block" id="parch-toggle" style="margin-top:16px">🗄 Prestations archivées (${archived.length})</button><div id="parch" class="hidden" style="margin-top:8px"></div>` : ""}
       </main>
       <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
 
-    let f = "tout";
-    let sortAsc = true; // true = date croissante (les plus proches / à venir d'abord)
+    if ($("#tb-action")) $("#tb-action").onclick = () => go("archivees");
+
+    let activeTag = "";
+    let sortAsc = true; // true = plus proches d'abord
     const byDate = (a, b) => {
       const da = a.date_presta || "", db2 = b.date_presta || "";
       if (!da && !db2) return 0;
-      if (!da) return 1;            // sans date -> à la fin
+      if (!da) return 1;
       if (!db2) return -1;
       return (da < db2 ? -1 : da > db2 ? 1 : 0) * (sortAsc ? 1 : -1);
     };
     const draw = () => {
-      let l = list;
-      if (f === "fixe") l = list.filter((p) => typeOf(p) === "fixe");
-      else if (f === "ponctuel") l = list.filter((p) => typeOf(p) === "ponctuel");
-      else if (f === "ao") l = list.filter(isAO);
+      let l = activeTag ? list.filter((p) => tagsOf(p).includes(activeTag)) : list;
       l = l.slice().sort(byDate);
+      // Regroupe par journée
+      const groups = {};
+      l.forEach((p) => ((groups[p.date_presta || "zzz"] ||= []).push(p)));
+      const keys = Object.keys(groups).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0) * (sortAsc ? 1 : -1));
       $("#plist").innerHTML = l.length
-        ? l.map(card).join("")
+        ? keys.map((k) => `<div class="section-title">${esc(dayLabel(k))} <span style="color:var(--muted);font-weight:600">· ${groups[k].length}</span></div>${groups[k].map(card).join("")}`).join("")
         : `<div class="empty"><div class="big">📋</div>Aucune prestation.</div>`;
     };
-    $("#pfilter").addEventListener("click", (e) => {
-      const b = e.target.closest("button");
+    const ptagf = $("#ptagf");
+    if (ptagf) ptagf.addEventListener("click", (e) => {
+      const b = e.target.closest(".ptag");
       if (!b) return;
-      f = b.dataset.f;
-      $$("#pfilter button").forEach((x) => x.classList.toggle("active", x === b));
+      activeTag = b.dataset.tag;
+      ptagf.querySelectorAll(".ptag").forEach((x) => (x.style.cssText = chipCss(x === b)));
       draw();
     });
     $("#psort").onclick = () => {
@@ -387,24 +407,77 @@
       draw();
     };
     draw();
+  }
 
-    // Section archivées (repliée par défaut)
-    const parchToggle = $("#parch-toggle");
-    if (parchToggle) parchToggle.onclick = () => {
-      const box = $("#parch");
-      const open = box.classList.toggle("hidden") === false;
-      parchToggle.textContent = (open ? "🗄 Masquer les archivées" : "🗄 Prestations archivées") + ` (${archived.length})`;
-      if (open && !box.dataset.drawn) {
-        box.dataset.drawn = "1";
-        box.innerHTML = archived.slice().sort(byDate).map(card).join("");
-      }
+  // =========================================================================
+  //  VUE : Prestations archivées (recherche + tri)
+  // =========================================================================
+  async function viewArchivesPresta() {
+    const all = await db.prestations();
+    const archived = all.filter((p) => p.archivee);
+    const cli = {};
+    (await db.clients()).forEach((c) => (cli[c.id] = c));
+
+    const card = (p) => `
+      <div class="card" data-pid="${p.id}">
+        <div class="tap" onclick="location.hash='#/prestation/${p.id}'" style="display:flex;align-items:center;gap:10px">
+          <div class="grow">
+            <div class="row between"><h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>${prestaBadge(p.statut)}</div>
+            <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}</div>
+          </div>
+          <div style="font-size:22px;color:#cbd5c9">›</div>
+        </div>
+        <button class="btn sm ghost" data-unarch="${p.id}" style="margin-top:8px;color:var(--green)">↩︎ Désarchiver</button>
+      </div>`;
+
+    app.innerHTML =
+      topbar("Prestations archivées", { back: "prestations" }) +
+      `<main>
+        <input id="asearch" placeholder="🔍 Rechercher (libellé, client, réf…)" style="margin-bottom:8px" />
+        <div class="row between" style="margin:2px 2px 10px">
+          <div class="sub">${archived.length} archivée(s)</div>
+          <button class="btn sm sec" id="asort" style="width:auto">📅 Plus récentes d'abord ↓</button>
+        </div>
+        <div id="alist"></div>
+      </main>`;
+
+    let q = "", sortAsc = false;
+    const byDate = (a, b) => {
+      const da = a.date_presta || "", db2 = b.date_presta || "";
+      return (da < db2 ? -1 : da > db2 ? 1 : 0) * (sortAsc ? 1 : -1);
     };
+    const draw = () => {
+      let l = archived;
+      if (q) l = l.filter((p) => [p.libelle, p.reference, cli[p.client_id] && cli[p.client_id].nom]
+        .some((v) => _norm(v || "").includes(q)));
+      l = l.slice().sort(byDate);
+      $("#alist").innerHTML = l.length ? l.map(card).join("")
+        : `<div class="empty"><div class="big">🗄</div>Aucune prestation archivée.</div>`;
+      $$("[data-unarch]").forEach((b) => b.onclick = async (e) => {
+        e.stopPropagation();
+        b.disabled = true;
+        const { error } = await sb.from("prestations").update({ archivee: false }).eq("id", b.dataset.unarch);
+        if (error) { b.disabled = false; return toast(error.message, "err"); }
+        toast("Prestation désarchivée ✔", "ok"); render();
+      });
+    };
+    $("#asearch").addEventListener("input", (e) => { q = _norm(e.target.value.trim()); draw(); });
+    $("#asort").onclick = () => {
+      sortAsc = !sortAsc;
+      $("#asort").textContent = sortAsc ? "📅 Plus anciennes d'abord ↑" : "📅 Plus récentes d'abord ↓";
+      draw();
+    };
+    draw();
   }
 
   // =========================================================================
   //  VUE : Écarts à traiter (terminées non archivées avec du à-facturer)
   // =========================================================================
   async function viewEcarts() {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Écarts à traiter", { back: "prestations" }) + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
     const [prestas, opens, clientsArr, typesArr] = await Promise.all([
       db.prestationsTerminees(), db.facturationsOpen(), db.clients(), db.types(),
     ]);
@@ -735,6 +808,9 @@
 
     const lineHtml = (t) => `
       <div class="mat-line" data-line="${t.id}" data-tags="${esc((t.tags || []).join("|"))}">
+        ${t.photo_url
+          ? `<img src="${esc(t.photo_url)}" alt="" style="width:38px;height:38px;border-radius:8px;object-fit:cover;flex:0 0 auto;background:#eef0ee;margin-right:8px" />`
+          : `<div style="width:38px;height:38px;border-radius:8px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:17px;margin-right:8px">📦</div>`}
         <div class="name"><b>${esc(t.nom)}</b><small>${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR — saisie manuelle"}</small></div>
         <div class="qty" data-type="${t.id}">
           <button data-d="-1">−</button>
@@ -1044,6 +1120,12 @@
     const perteByType = {};
     (factRes.data || []).forEach((f) => (perteByType[f.type_id] = (perteByType[f.type_id] || 0) + f.quantite));
     const dejaValide = p.statut === "recupere" || p.statut === "livre";
+    // Vignettes photo du matériel
+    const typePhoto = {};
+    (await db.types()).forEach((t) => (typePhoto[t.id] = t.photo_url));
+    const thumb = (tid) => typePhoto[tid]
+      ? `<img src="${esc(typePhoto[tid])}" alt="" style="width:40px;height:40px;border-radius:8px;object-fit:cover;flex:0 0 auto;background:#eef0ee" />`
+      : `<div style="width:40px;height:40px;border-radius:8px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:18px">📦</div>`;
 
     const line = (b) => {
       const exp = b.q_sortie;
@@ -1051,7 +1133,7 @@
       const rec = exp - nonrec;
       return `
       <div class="card" data-rec="${b.type_id}" data-exp="${exp}" data-prix="${b.prix_unitaire}" data-nom="${esc(b.type_nom)}">
-        <div class="row between"><b>${esc(b.type_nom)}</b><span class="badge gray">Sortis ${exp}</span></div>
+        <div class="row between" style="align-items:center;gap:10px"><div class="row" style="align-items:center;gap:10px">${thumb(b.type_id)}<b>${esc(b.type_nom)}</b></div><span class="badge gray">Sortis ${exp}</span></div>
         <div class="field-row" style="margin-top:8px">
           <div><label style="margin-top:0">Récupéré</label><input class="rec-in" type="number" inputmode="numeric" value="${rec}" min="0" max="${exp}" /></div>
           <div><label style="margin-top:0">Non récupéré</label><input class="nonrec-in" type="number" inputmode="numeric" value="${nonrec}" min="0" max="${exp}" /></div>
@@ -1180,6 +1262,10 @@ Total : ${eur(total)} HT`;
   //  VUE : Rapport des manquants + facturation
   // =========================================================================
   async function viewManquants(id) {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Manquants") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
     const p = await db.prestation(id);
     const bilan = await db.bilan(id);
     const facts = await db.facturations(id);
@@ -1190,14 +1276,17 @@ Total : ${eur(total)} HT`;
     const typeName = (tid) => (typeMap[tid] ? typeMap[tid].nom : "Matériel");
 
     const manquants = bilan.filter((b) => b.q_manquant > 0);
+    const openFacts = facts.filter((f) => f.statut === "a_facturer");
     const totalFact = facts.filter((f) => f.statut !== "annule").reduce((s, f) => s + Number(f.montant), 0);
 
     app.innerHTML =
-      topbar("Manquants · " + (p.libelle || ""), { back: "prestation/" + id }) +
+      topbar("À facturer · " + (p.libelle || ""), { back: "prestation/" + id }) +
       `<main>
-        ${manquants.length === 0
-          ? `<div class="card" style="text-align:center"><div style="font-size:34px">✅</div><b>Tout est revenu !</b><div class="sub">Aucun matériel manquant sur cette prestation.</div></div>`
-          : `<button class="btn block" id="mail-compta">✉️ Envoyer les manquants à la compta</button>
+        ${(manquants.length === 0 && openFacts.length === 0)
+          ? `<div class="card" style="text-align:center"><div style="font-size:34px">✅</div><b>Rien à facturer</b><div class="sub">Tout est réglé sur cette prestation.</div></div>`
+          : (manquants.length === 0
+            ? `<div class="card"><div class="sub">Aucun manquant nouveau à pointer — voir les lignes déjà à facturer ci-dessous.</div></div>`
+            : `<button class="btn block" id="mail-compta">✉️ Envoyer les manquants à la compta</button>
              <div class="section-title">À réclamer / facturer</div>` +
             manquants.map((b) => `
               <div class="card">
@@ -1210,7 +1299,7 @@ Total : ${eur(total)} HT`;
                   <button class="btn warn sm" data-fact='${b.type_id}|casse'>Facturer (casse)</button>
                   <button class="btn danger sm" data-fact='${b.type_id}|perte'>Facturer (perte)</button>
                 </div>
-              </div>`).join("")
+              </div>`).join(""))
         }
 
         ${facts.length ? `<div class="section-title">Facturations enregistrées — total ${eur(totalFact)}</div>` +
@@ -1670,8 +1759,9 @@ Total : ${eur(total)} HT`;
                 </select></div>
             </div>
             <button class="btn sec block u-save" data-uid="${u.id}" style="margin-top:8px">Enregistrer</button>
+            ${u.id === state.user.id ? "" : `<button class="btn ghost block u-del" data-uid="${u.id}" data-nom="${esc(u.nom || "ce membre")}" style="margin-top:8px;color:var(--danger)">🗑 Supprimer le compte</button>`}
           </div>`).join("")}
-        <div class="card"><div class="sub">Un désactivé ne peut plus se connecter. La création d'un compte se fait par la personne elle-même (écran de connexion → « Créer un compte »). Le changement de mot de passe/e-mail et la suppression définitive passent par la console Supabase.</div></div>
+        <div class="card"><div class="sub">Un désactivé garde son compte mais ne peut plus se connecter. « Supprimer le compte » l'efface définitivement (connexion + profil) — action irréversible. La création d'un compte se fait par la personne elle-même (écran de connexion → « Créer un compte »). Le changement de mot de passe/e-mail passe par la console Supabase.</div></div>
         <div class="section-title">Clients importés de Sextan à valider${aValider.length ? ` (${aValider.length})` : ""}</div>
         ${aValider.length ? aValider.map((c) => `
           <div class="card"><div class="row between">
@@ -1727,6 +1817,34 @@ Total : ${eur(total)} HT`;
       b.disabled = false;
       if (error) return toast(error.message, "err");
       toast("Compte enregistré ✔", "ok"); render();
+    });
+    $$(".u-del").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) {
+          armed = true;
+          b.textContent = `Confirmer la suppression de ${b.dataset.nom} ?`;
+          b.classList.remove("ghost"); b.classList.add("danger");
+          setTimeout(() => { if (!armed) return; armed = false; b.textContent = "🗑 Supprimer le compte"; b.classList.add("ghost"); b.classList.remove("danger"); }, 4500);
+          return;
+        }
+        b.disabled = true;
+        try {
+          const { data: sess } = await sb.auth.getSession();
+          const token = sess && sess.session ? sess.session.access_token : "";
+          const res = await fetch(CFG.SUPABASE_URL + "/functions/v1/admin-delete-user", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token, "apikey": CFG.SUPABASE_ANON_KEY },
+            body: JSON.stringify({ user_id: b.dataset.uid }),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok || out.error) throw new Error(out.error || ("HTTP " + res.status));
+          toast("Compte supprimé ✔", "ok"); render();
+        } catch (e) {
+          b.disabled = false;
+          toast("Suppression impossible : " + (e.message || e), "err");
+        }
+      };
     });
     $$(".valider-cli").forEach((b) => b.onclick = async () => {
       b.disabled = true;
@@ -2592,7 +2710,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.4</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.5</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
