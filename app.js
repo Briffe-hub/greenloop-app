@@ -1475,6 +1475,7 @@ Total : ${eur(total)} HT`;
         <td style="padding:5px"><input class="m-code" value="${esc(t.code_qr || "")}" placeholder="auto" style="${inCss};width:120px;font-family:monospace" /></td>
         ${tags.map((tag) => `<td style="text-align:center;padding:5px"><input type="checkbox" class="m-tag" data-tag="${esc(tag.nom)}" ${tg.includes(tag.nom) ? "checked" : ""} style="width:20px;height:20px" /></td>`).join("")}
         <td style="text-align:center;padding:5px"><input type="checkbox" class="m-actif" ${t.actif !== false ? "checked" : ""} style="width:20px;height:20px" /></td>
+        <td style="text-align:center;padding:5px"><button type="button" class="m-del" title="Supprimer" style="border:none;background:none;color:var(--danger);font-size:16px;cursor:pointer;padding:4px 8px">🗑</button></td>
       </tr>`;
     };
     app.innerHTML =
@@ -1494,6 +1495,7 @@ Total : ${eur(total)} HT`;
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Code QR</th>
               ${tags.map((t) => `<th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">${esc(t.nom)}${t.is_base ? " ★" : ""}</th>`).join("")}
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Actif</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Suppr.</th>
             </tr></thead>
             <tbody id="masse-body">${types.map(rowHtml).join("")}</tbody>
           </table>
@@ -1508,6 +1510,28 @@ Total : ${eur(total)} HT`;
       const rows = $$("#masse-body tr");
       rows[rows.length - 1].querySelector(".m-nom").focus();
     };
+
+    // Suppression d'une ligne (deux temps). Repli en archivage si un historique existe.
+    $("#masse-body").addEventListener("click", async (e) => {
+      const b = e.target.closest(".m-del");
+      if (!b) return;
+      const tr = b.closest("tr"), id = tr.dataset.id;
+      if (b.dataset.armed !== "1") {
+        b.dataset.armed = "1"; b.textContent = "❌ sûr ?";
+        setTimeout(() => { if (b.dataset.armed === "1") { b.dataset.armed = ""; b.textContent = "🗑"; } }, 3000);
+        return;
+      }
+      if (!id) { tr.remove(); return; } // ligne jamais enregistrée
+      b.disabled = true;
+      const { error } = await sb.from("materiel_types").delete().eq("id", id);
+      if (error) {
+        // référencé par des mouvements/facturations -> on archive plutôt que casser l'historique
+        const { error: e2 } = await sb.from("materiel_types").update({ actif: false }).eq("id", id);
+        if (e2) { b.disabled = false; b.dataset.armed = ""; b.textContent = "🗑"; return toast(e2.message, "err"); }
+        tr.remove(); return toast("Matériel archivé (un historique existe, données conservées)", "ok");
+      }
+      tr.remove(); toast("Matériel supprimé ✔", "ok");
+    });
 
     // Ajout d'une catégorie à la volée (sans quitter l'écran ni perdre les modifs)
     const catAdd = $("#mcat-add"), catInput = $("#mcat-new");
@@ -2803,7 +2827,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.8</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v1.9</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
