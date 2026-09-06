@@ -431,9 +431,19 @@
         const st = $("#pbulk-statut").value;
         const btn = $("#pbulk-mark"); btn.disabled = true;
         const { error } = await sb.from("prestations").update({ statut: st }).in("id", ids);
+        if (error) { btn.disabled = false; return toast(error.message, "err"); }
+        // Archivage auto des prestations désormais terminées et sans écart :
+        //  - "récupéré"/"clos" = terminal pour tout le monde
+        //  - "livré" = terminal pour les clients FIXES (rien à récupérer, le matériel reste chez eux)
+        const toArchive = ids.filter((id) => {
+          if (ecartIds.has(id)) return false;                 // écart à traiter -> on n'archive pas
+          if (st === "recupere" || st === "clos") return true;
+          if (st === "livre") { const c = cli[(list.find((x) => x.id === id) || {}).client_id]; return c && c.type_client === "fixe"; }
+          return false;
+        });
+        if (toArchive.length) await sb.from("prestations").update({ archivee: true }).in("id", toArchive);
         btn.disabled = false;
-        if (error) return toast(error.message, "err");
-        toast(`${ids.length} prestation(s) → ${STATUT_LABEL[st]} ✔`, "ok");
+        toast(`${ids.length} → ${STATUT_LABEL[st]}${toArchive.length ? ` · ${toArchive.length} archivée(s)` : ""} ✔`, "ok");
         render();
       };
       $("#pbulk-arch").onclick = async () => {
@@ -2868,7 +2878,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.2</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.3</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
