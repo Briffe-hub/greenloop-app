@@ -690,6 +690,8 @@
           </select>
           <label>Notes</label>
           <textarea id="f-notes" placeholder="Infos utiles…">${esc(p.notes || "")}</textarea>
+          <label>Lien preuve Consignerie (QR du BL)</label>
+          <input id="f-consurl" value="${esc(p.consignerie_url || "")}" placeholder="https://app.consignerie.com/bl/…" />
           <button class="btn block" id="save">Enregistrer les modifications</button>
         </div>
         <div class="card"><div class="sub">Modifier le client ou la date ne change pas les mouvements de matériel déjà enregistrés. Pour corriger les quantités sorties/récupérées, utilise « Revoir la sortie » / « Récupération » sur la fiche.</div></div>
@@ -706,6 +708,7 @@
         reference: $("#f-ref").value.trim() || null,
         statut: $("#f-statut").value,
         notes: $("#f-notes").value.trim() || null,
+        consignerie_url: $("#f-consurl").value.trim() || null,
       }).eq("id", id);
       $("#save").disabled = false;
       toast(error ? error.message : "Prestation modifiée ✔", error ? "err" : "ok");
@@ -792,6 +795,15 @@
       <a href="#/prestation/${id}/sortie" style="color:var(--muted)">Revoir la sortie</a>
       ${!fixe ? ` · <a href="#/prestation/${id}/recuperation" style="color:var(--muted)">Récupération</a>` : ` · <a href="#/prestation/${id}/retour" style="color:var(--muted)">Récupération</a>`}
     </div>`);
+
+    // Preuve de livraison Consignerie (prestations issues de briffetools / La consignerie)
+    if (p.source === "briffetools" || isConsigUrl(p.consignerie_url)) {
+      const kwrap = document.createElement("div");
+      kwrap.style.cssText = "margin-top:20px";
+      kwrap.innerHTML = consignerieCardHtml(p);
+      app.querySelector("main").appendChild(kwrap);
+      wireConsignerieCard(p);
+    }
 
     // Commentaire livreur -> logistique (livraison + récupération)
     if (["en_livraison", "a_recuperer", "recupere", "livre"].includes(p.statut)) {
@@ -2459,6 +2471,111 @@ Total : ${eur(total)} HT`;
       }
     };
   }
+
+  // =========================================================================
+  //  Preuve de livraison Consignerie : photo archivée dans GreenLoop
+  //  + ouverture de la page Consignerie (lien du QR), sans re-scanner.
+  // =========================================================================
+  const isConsigUrl = (u) => /consignerie\.com\/bl\//i.test(u || "");
+  function consignerieCardHtml(p) {
+    const has = isConsigUrl(p.consignerie_url);
+    const photo = p.preuve_photo_url;
+    return `<div class="card" id="cons-card">
+      <div class="sub" style="font-weight:700;margin-bottom:6px">📸 Preuve de livraison Consignerie</div>
+      ${has ? `
+        <div id="cons-photo-wrap">${photo ? `<img src="${esc(photo)}" alt="preuve" style="width:100%;border-radius:10px;display:block;margin-bottom:8px" />` : ""}</div>
+        <input id="cons-cam" type="file" accept="image/*" capture="environment" style="display:none" />
+        <div class="btn-grid">
+          <button type="button" class="btn sec" id="cons-photo-btn">📷 ${photo ? "Reprendre la photo" : "Prendre la photo"}</button>
+          <button type="button" class="btn" id="cons-open">➡️ Ouvrir la preuve Consignerie</button>
+        </div>
+        <div class="sub" style="margin-top:6px">La photo est archivée ici. Ouvre ensuite la page Consignerie et dépose la même photo (elle est dans ta galerie).</div>
+        <button type="button" class="btn ghost sm" id="cons-unlink" style="margin-top:8px;color:var(--muted)">Délier ce bon</button>
+      ` : `
+        <div class="sub" style="margin-bottom:6px">Aucun bon Consignerie lié. Scanne le QR du BL une fois (ou colle le lien) : ensuite les livreurs n'auront plus à scanner.</div>
+        <div id="cons-scan" class="hidden"><div id="cons-scanbox" style="border-radius:10px;overflow:hidden;margin-bottom:8px;background:#000"></div></div>
+        <button type="button" class="btn sec block" id="cons-scan-btn">🔗 Scanner le QR du BL</button>
+        <div class="field-row" style="margin-top:8px">
+          <input id="cons-url" placeholder="…ou coller https://app.consignerie.com/bl/…" />
+          <button type="button" class="btn sm sec" id="cons-url-save" style="flex:0 0 auto">OK</button>
+        </div>
+      `}
+    </div>`;
+  }
+  function wireConsignerieCard(p) {
+    const saveUrl = async (url) => {
+      if (!isConsigUrl(url)) { toast("Lien Consignerie invalide (doit contenir consignerie.com/bl/…)", "err"); return false; }
+      const { error } = await sb.from("prestations").update({ consignerie_url: url.trim() }).eq("id", p.id);
+      if (error) { toast(error.message, "err"); return false; }
+      toast("Bon Consignerie lié ✔", "ok"); render(); return true;
+    };
+    const openBtn = $("#cons-open");
+    if (openBtn) openBtn.onclick = () => window.open(p.consignerie_url, "_blank");
+
+    const unlink = $("#cons-unlink");
+    if (unlink) unlink.onclick = async () => {
+      const { error } = await sb.from("prestations").update({ consignerie_url: null }).eq("id", p.id);
+      toast(error ? error.message : "Bon délié ✔", error ? "err" : "ok");
+      if (!error) render();
+    };
+
+    // Prise + archivage de la photo de preuve (bucket materiel-photos, préfixe preuves/)
+    const camBtn = $("#cons-photo-btn"), cam = $("#cons-cam");
+    if (camBtn && cam) {
+      camBtn.onclick = () => cam.click();
+      cam.onchange = async () => {
+        const f = cam.files && cam.files[0];
+        if (!f) return;
+        camBtn.disabled = true; camBtn.textContent = "⏳ Envoi…";
+        try {
+          const blob = await resizeImage(f, 1400, 0.8);
+          const path = `preuves/${p.id}/${Date.now()}.jpg`;
+          const up = await sb.storage.from("materiel-photos").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+          if (up.error) throw up.error;
+          const { data: pub } = sb.storage.from("materiel-photos").getPublicUrl(path);
+          const { error } = await sb.from("prestations").update({ preuve_photo_url: pub.publicUrl }).eq("id", p.id);
+          if (error) throw error;
+          toast("Photo archivée ✔ — ouvre la page Consignerie pour la déposer", "ok");
+          render();
+        } catch (e) {
+          camBtn.disabled = false; camBtn.textContent = "📷 Réessayer";
+          toast("Photo : " + (e.message || e), "err");
+        }
+      };
+    }
+
+    // Coller le lien
+    const urlSave = $("#cons-url-save");
+    if (urlSave) urlSave.onclick = () => saveUrl($("#cons-url").value);
+
+    // Scanner le QR une fois (scanner local, indépendant du scanner de sortie)
+    const scanBtn = $("#cons-scan-btn");
+    if (scanBtn) {
+      let scanner = null;
+      scanBtn.onclick = async () => {
+        const box = $("#cons-scan");
+        if (scanner) { try { await scanner.stop(); scanner.clear(); } catch (e) {} scanner = null; box.classList.add("hidden"); scanBtn.textContent = "🔗 Scanner le QR du BL"; return; }
+        box.classList.remove("hidden");
+        scanBtn.textContent = "✕ Arrêter le scan";
+        try {
+          scanner = new Html5Qrcode("cons-scanbox", { verbose: false });
+          let done = false;
+          await scanner.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 220, height: 220 } },
+            async (decoded) => {
+              if (done) return;
+              if (!isConsigUrl(decoded)) return; // ignore les autres QR
+              done = true;
+              try { await scanner.stop(); scanner.clear(); } catch (e) {}
+              scanner = null;
+              saveUrl(decoded);
+            }, () => {});
+        } catch (e) {
+          box.innerHTML = `<div style="padding:16px;color:#fff;text-align:center;font-size:13px">📷 Caméra indisponible — colle le lien ci-dessous.</div>`;
+        }
+      };
+    }
+  }
+
   const clientBadge = (t) =>
     t === "fixe" ? '<span class="badge blue">Fixe</span>' : '<span class="badge gray">Ponctuel</span>';
 
@@ -2878,7 +2995,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.3</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.4</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
