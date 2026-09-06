@@ -373,9 +373,13 @@
         </div>
         ${admin ? `<div class="sub" style="margin:0 2px 8px">☑︎ Coche des prestations pour les archiver en bloc.</div>` : ""}
         <div id="plist"></div>
-        ${admin ? `<div id="pbulk" class="hidden" style="position:sticky;bottom:calc(84px + var(--safe-b));background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;gap:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);margin-top:10px">
-          <button class="btn ghost" id="pbulk-cancel" style="flex:0 0 auto">Annuler</button>
-          <button class="btn" id="pbulk-arch" style="flex:1">🗄 Archiver (0)</button>
+        ${admin ? `<div id="pbulk" class="hidden" style="position:sticky;bottom:calc(84px + var(--safe-b));background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);margin-top:10px">
+          <div class="row between"><b id="pbulk-count">0 sélectionnée(s)</b><button class="btn sm ghost" id="pbulk-cancel" style="flex:0 0 auto">Annuler</button></div>
+          <div class="field-row">
+            <select id="pbulk-statut">${Object.keys(STATUT_LABEL).map((s) => `<option value="${s}" ${s === "livre" ? "selected" : ""}>${esc(STATUT_LABEL[s])}</option>`).join("")}</select>
+            <button class="btn sm sec" id="pbulk-mark" style="flex:0 0 auto">Marquer</button>
+          </div>
+          <button class="btn" id="pbulk-arch">🗄 Archiver (0)</button>
         </div>` : ""}
       </main>
       <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
@@ -406,10 +410,13 @@
 
     // --- Sélection multiple / archivage en bloc (admin) ---
     function refreshBulk() {
-      const bar = $("#pbulk"), btn = $("#pbulk-arch");
+      const bar = $("#pbulk");
       if (!bar) return;
-      if (selected.size) { bar.classList.remove("hidden"); btn.textContent = `🗄 Archiver (${selected.size})`; }
-      else bar.classList.add("hidden");
+      if (selected.size) {
+        bar.classList.remove("hidden");
+        $("#pbulk-count").textContent = `${selected.size} sélectionnée(s)`;
+        $("#pbulk-arch").textContent = `🗄 Archiver (${selected.size})`;
+      } else bar.classList.add("hidden");
     }
     if (admin) {
       $("#plist").addEventListener("change", (e) => {
@@ -418,6 +425,17 @@
         refreshBulk();
       });
       $("#pbulk-cancel").onclick = () => { selected.clear(); $$(".psel").forEach((c) => (c.checked = false)); refreshBulk(); };
+      $("#pbulk-mark").onclick = async () => {
+        const ids = [...selected];
+        if (!ids.length) return;
+        const st = $("#pbulk-statut").value;
+        const btn = $("#pbulk-mark"); btn.disabled = true;
+        const { error } = await sb.from("prestations").update({ statut: st }).in("id", ids);
+        btn.disabled = false;
+        if (error) return toast(error.message, "err");
+        toast(`${ids.length} prestation(s) → ${STATUT_LABEL[st]} ✔`, "ok");
+        render();
+      };
       $("#pbulk-arch").onclick = async () => {
         const ids = [...selected];
         if (!ids.length) return;
@@ -2850,7 +2868,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.1</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.2</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
