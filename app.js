@@ -636,6 +636,8 @@
             <div><label>Date de livraison</label><input id="f-date" type="date" value="${new Date().toISOString().slice(0,10)}" /></div>
             <div><label>Numéro</label><input id="f-ref" placeholder="N° dossier" /></div>
           </div>
+          <label>Nombre de convives (pré-remplissage sortie)</label>
+          <input id="f-pax" type="number" min="0" placeholder="ex : 45" />
           <label>Notes</label>
           <textarea id="f-notes" placeholder="Infos utiles pour le livreur…"></textarea>
           <button class="btn block" id="save">Créer la prestation</button>
@@ -653,6 +655,7 @@
           client_id: $("#f-client").value || null,
           date_presta: $("#f-date").value || null,
           reference: $("#f-ref").value.trim() || null,
+          pax: parseInt($("#f-pax").value) || null,
           notes: $("#f-notes").value.trim() || null,
           created_by: state.user.id,
         })
@@ -690,6 +693,8 @@
           </select>
           <label>Notes</label>
           <textarea id="f-notes" placeholder="Infos utiles…">${esc(p.notes || "")}</textarea>
+          <label>Nombre de convives (pré-remplissage sortie)</label>
+          <input id="f-pax" type="number" min="0" value="${p.pax != null ? p.pax : ""}" placeholder="ex : 45" />
           <label>Lien preuve Consignerie (QR du BL)</label>
           <input id="f-consurl" value="${esc(p.consignerie_url || "")}" placeholder="https://app.consignerie.com/bl/…" />
           <button class="btn block" id="save">Enregistrer les modifications</button>
@@ -708,6 +713,7 @@
         reference: $("#f-ref").value.trim() || null,
         statut: $("#f-statut").value,
         notes: $("#f-notes").value.trim() || null,
+        pax: parseInt($("#f-pax").value) || null,
         consignerie_url: $("#f-consurl").value.trim() || null,
       }).eq("id", id);
       $("#save").disabled = false;
@@ -733,7 +739,7 @@
           <div class="row between">
             <div class="grow">
               <h3 style="cursor:pointer" ${p.client_id ? `onclick="location.hash='#/client/${p.client_id}'"` : ""}>${esc(p.clients ? p.clients.nom : "Client ?")}</h3>
-              <div class="sub">${p.clients ? (p.clients.type_client === "fixe" ? "Client fixe · " : "Client ponctuel · ") : ""}${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}</div>
+              <div class="sub">${p.clients ? (p.clients.type_client === "fixe" ? "Client fixe · " : "Client ponctuel · ") : ""}${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}${p.pax ? " · " + p.pax + " pers." : ""}</div>
             </div>
             ${prestaBadge(p.statut)}
           </div>
@@ -902,6 +908,24 @@
     (mvtRes.data || []).forEach((m) => (counts[m.type_id] = (counts[m.type_id] || 0) + m.quantite));
     // en retour, les casses/pertes ont été comptées comme "revenues" : on les retire de la saisie normale
     if (sens === "retour") Object.keys(cpByType).forEach((tid) => (counts[tid] = Math.max(0, (counts[tid] || 0) - cpByType[tid])));
+
+    // Pré-remplissage de la sortie d'après la dotation (nb de convives), si aucune sortie n'a
+    // encore été saisie. Limité au(x) pack(s) présélectionné(s) pour ce type de prestation.
+    let prefilled = false;
+    if (sens === "sortie" && (mvtRes.data || []).length === 0 && p.pax > 0) {
+      const inPack = (t) => {
+        if (!preselTags.length) return true; // aucun pack mappé -> tout le matériel doté
+        const tgs = t.tags || [];
+        return tgs.some((x) => preselTags.includes(x)) || tgs.some((x) => baseTags.includes(x));
+      };
+      types.forEach((t) => {
+        const fixe = t.dotation_fixe || 0, perPax = t.dotation_pax || 0;
+        if ((fixe > 0 || perPax > 0) && inPack(t)) {
+          const q = fixe + (perPax > 0 ? Math.ceil(p.pax / perPax) : 0);
+          if (q > 0) { counts[t.id] = q; prefilled = true; }
+        }
+      });
+    }
     const byCode = {};
     types.forEach((t) => { if (t.code_qr) byCode[t.code_qr.trim()] = t; });
 
@@ -946,6 +970,7 @@
           ${allTags.map((tg) => { const on = preselTags.includes(tg.nom); return `<button type="button" class="tagf" data-tag="${esc(tg.nom)}" data-on="${on ? "1" : "0"}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
         </div>` : ""}
 
+        ${prefilled ? `<div class="card" style="background:#eef7ee;border-color:var(--green)"><div class="sub" style="color:var(--green-d)">✨ Quantités <b>pré-remplies</b> d'après la dotation pour <b>${p.pax} pers.</b> — vérifie et ajuste avant de valider.</div></div>` : ""}
         <div class="section-title">Matériel ${verb}</div>
         <div class="list" id="qty-card">
           ${Object.keys(byCat).sort().map((cat) => `
@@ -1522,6 +1547,8 @@ Total : ${eur(total)} HT`;
           const st = t.stock_total || 0;
           return `<input class="m-parc" type="number" step="1" value="${st}" data-locked="${locked ? 1 : 0}" data-stock="${st}" ${locked ? "readonly" : ""} title="${locked ? "Parc verrouillé — ajuste via le journal du matériel" : "Parc initial (verrouillé après enregistrement)"}" style="${inCss};width:72px${locked ? ";background:#f1f3f0" : ""}" />`;
         })()}</td>
+        <td style="padding:5px"><input class="m-dotfixe" type="number" step="1" min="0" value="${t.dotation_fixe || 0}" title="Quantité fixe pré-remplie à la sortie" style="${inCss};width:64px" /></td>
+        <td style="padding:5px"><input class="m-dotpax" type="number" step="1" min="0" value="${t.dotation_pax || 0}" title="1 exemplaire pour X personnes (0 = aucune)" style="${inCss};width:64px" /></td>
         ${tags.map((tag) => `<td style="text-align:center;padding:5px"><input type="checkbox" class="m-tag" data-tag="${esc(tag.nom)}" ${tg.includes(tag.nom) ? "checked" : ""} style="width:20px;height:20px" /></td>`).join("")}
         <td style="text-align:center;padding:5px"><input type="checkbox" class="m-actif" ${t.actif !== false ? "checked" : ""} style="width:20px;height:20px" /></td>
         <td style="text-align:center;padding:5px"><button type="button" class="m-del" title="Supprimer" style="border:none;background:none;color:var(--danger);font-size:16px;cursor:pointer;padding:4px 8px">🗑</button></td>
@@ -1543,6 +1570,8 @@ Total : ${eur(total)} HT`;
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Prix HT €</th>
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Code QR</th>
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Parc</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)" title="Quantité fixe pré-remplie à la sortie">Dot. fixe</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)" title="1 pour X personnes">Dot. /pers</th>
               ${tags.map((t) => `<th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">${esc(t.nom)}${t.is_base ? " ★" : ""}</th>`).join("")}
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Actif</th>
               <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Suppr.</th>
@@ -1625,6 +1654,8 @@ Total : ${eur(total)} HT`;
           tags: Array.from(tr.querySelectorAll(".m-tag")).filter((c) => c.checked).map((c) => c.dataset.tag),
           actif: tr.querySelector(".m-actif").checked,
           stock_total: pVal,
+          dotation_fixe: parseInt(tr.querySelector(".m-dotfixe").value) || 0,
+          dotation_pax: parseInt(tr.querySelector(".m-dotpax").value) || 0,
         });
       });
       if (!rows.length) return toast("Rien à enregistrer", "err");
@@ -2142,6 +2173,12 @@ Total : ${eur(total)} HT`;
             ${allTags.map((tg) => { const on = (t.tags || []).includes(tg.nom); return `<button type="button" class="tagchip" data-tag="${esc(tg.nom)}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
           </div>
           <div class="sub" style="margin-top:4px">Coche les packs où ce matériel doit apparaître à la sortie (Cocktails, Buffets…). ★ = pack de base (toujours visible). <a href="#/tags" style="color:var(--green)">Gérer les tags</a></div>
+          <label>Dotation (pré-remplissage à la sortie)</label>
+          <div class="field-row">
+            <div><label style="margin-top:0">Quantité fixe</label><input id="t-dotfixe" type="number" step="1" min="0" value="${t.dotation_fixe || 0}" /></div>
+            <div><label style="margin-top:0">1 pour X pers.</label><input id="t-dotpax" type="number" step="1" min="0" value="${t.dotation_pax || 0}" placeholder="0 = aucune" /></div>
+          </div>
+          <div class="sub" style="margin-top:-4px">À la sortie d'une prestation AO, la quantité est pré-remplie = fixe + arrondi(nb de convives ÷ « 1 pour X »). Laisse 0 pour ne pas doter ce matériel.</div>
           <label>Code QR (identique sur tous les exemplaires de ce type)</label>
           <div class="field-row">
             <input id="t-code" value="${esc(t.code_qr||"")}" placeholder="GL-…" style="font-family:monospace" />
@@ -2268,6 +2305,8 @@ Total : ${eur(total)} HT`;
         stock_total: parcInitial,
         code_qr: code || null,
         tags: Array.from(tagSet),
+        dotation_fixe: parseInt($("#t-dotfixe").value) || 0,
+        dotation_pax: parseInt($("#t-dotpax").value) || 0,
       };
       $("#save").disabled = true;
       let error, newId = tid;
@@ -2995,7 +3034,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.4</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.5</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
