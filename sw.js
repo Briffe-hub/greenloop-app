@@ -1,7 +1,7 @@
 /* GreenLoop — Service Worker
    Cache "app shell" pour l'installation PWA et un chargement rapide.
    Les données (Supabase) ne sont pas mises en cache : toujours en réseau. */
-const CACHE = "greenloop-v2";
+const CACHE = "greenloop-v3";
 const SHELL = [
   "./",
   "./index.html",
@@ -35,7 +35,9 @@ self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   if (url.origin !== location.origin) return;
   e.respondWith(
-    fetch(e.request)
+    // no-cache : on force la revalidation auprès du serveur pour éviter de servir
+    // un app.js périmé par le cache HTTP du navigateur.
+    fetch(e.request, { cache: "no-cache" })
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
