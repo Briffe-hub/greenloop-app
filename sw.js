@@ -1,7 +1,7 @@
 /* GreenLoop — Service Worker
    Cache "app shell" pour l'installation PWA et un chargement rapide.
    Les données (Supabase) ne sont pas mises en cache : toujours en réseau. */
-const CACHE = "greenloop-v3";
+const CACHE = "greenloop-v4";
 const SHELL = [
   "./",
   "./index.html",
