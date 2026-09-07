@@ -597,6 +597,7 @@
         <div class="sub" style="margin-top:6px">${fs.map((f) => `${f.quantite}× ${esc(tname[f.type_id] || "Matériel")} · ${esc(f.motif)}`).join("<br>")}</div>
         <div class="btn-grid" style="margin-top:10px">
           <button class="btn sec" onclick="location.hash='#/prestation/${p.id}/manquants'">📊 Détail</button>
+          <button class="btn sec" data-mail="${p.id}">✉️ Récap mail</button>
           <button class="btn" data-arch="${p.id}">✅ Traité — archiver</button>
         </div>
       </div>`;
@@ -616,6 +617,50 @@
       if (error) { b.disabled = false; return toast(error.message, "err"); }
       toast("Écart traité — prestation archivée ✔", "ok");
       render();
+    });
+
+    const pById = {}; list.forEach((p) => (pById[p.id] = p));
+    $$("[data-mail]").forEach((b) => b.onclick = async () => {
+      const p = pById[b.dataset.mail]; if (!p) return;
+      const fs = openByP[p.id] || [];
+      const total = fs.reduce((s, f) => s + amount(f), 0);
+      const lignes = fs.map((f) => ({
+        quantite: f.quantite,
+        materiel: tname[f.type_id] || "Matériel",
+        motif: f.motif || "",
+        montant: amount(f),
+      }));
+      const old = b.textContent;
+      b.disabled = true; b.textContent = "⏳ Envoi…";
+      try {
+        const { data: sess } = await sb.auth.getSession();
+        const token = sess && sess.session ? sess.session.access_token : "";
+        const res = await fetch(CFG.SUPABASE_URL + "/functions/v1/send-ecart", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + token,
+            "apikey": CFG.SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            prestation_lib: p.libelle || p.reference || "Prestation",
+            client_nom: cli[p.client_id] ? cli[p.client_id].nom : "",
+            date_presta: p.date_presta || "",
+            reference: p.reference || "",
+            total,
+            lignes,
+            envoyeur_nom: (state.profile && state.profile.nom) || state.user.email,
+            envoyeur_email: state.user.email,
+          }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok || out.error) throw new Error(out.error || ("HTTP " + res.status));
+        toast("Récap envoyé" + (out.to ? " à " + out.to : "") + " ✔", "ok");
+        b.disabled = false; b.textContent = old;
+      } catch (e) {
+        b.disabled = false; b.textContent = "✉️ Réessayer";
+        toast("Envoi impossible : " + (e.message || e), "err");
+      }
     });
   }
 
@@ -909,22 +954,35 @@
     // en retour, les casses/pertes ont été comptées comme "revenues" : on les retire de la saisie normale
     if (sens === "retour") Object.keys(cpByType).forEach((tid) => (counts[tid] = Math.max(0, (counts[tid] || 0) - cpByType[tid])));
 
-    // Pré-remplissage de la sortie d'après la dotation (nb de convives), si aucune sortie n'a
-    // encore été saisie. Limité au(x) pack(s) présélectionné(s) pour ce type de prestation.
-    let prefilled = false;
-    if (sens === "sortie" && (mvtRes.data || []).length === 0 && p.pax > 0) {
-      const inPack = (t) => {
-        if (!preselTags.length) return true; // aucun pack mappé -> tout le matériel doté
-        const tgs = t.tags || [];
-        return tgs.some((x) => preselTags.includes(x)) || tgs.some((x) => baseTags.includes(x));
-      };
-      types.forEach((t) => {
-        const fixe = t.dotation_fixe || 0, perPax = t.dotation_pax || 0;
-        if ((fixe > 0 || perPax > 0) && inPack(t)) {
-          const q = fixe + (perPax > 0 ? Math.ceil(p.pax / perPax) : 0);
-          if (q > 0) { counts[t.id] = q; prefilled = true; }
-        }
+    // Pré-remplissage de la sortie, si aucune sortie n'a encore été saisie.
+    //  1) priorité à la « préparation » calculée par briffetools (liste {code, qte})
+    //  2) sinon, dotation globale par matériel (fixe / 1 pour X pers.), limitée au pack.
+    let prefilled = false, prefillSrc = "";
+    if (sens === "sortie" && (mvtRes.data || []).length === 0) {
+      const codeMap = {};
+      types.forEach((t) => { if (t.code_qr) codeMap[t.code_qr.trim()] = t; });
+      const prep = Array.isArray(p.preparation) ? p.preparation : [];
+      prep.forEach((it) => {
+        const t = codeMap[String(it && it.code || "").trim()];
+        const q = parseInt(it && it.qte) || 0;
+        if (t && q > 0) { counts[t.id] = (counts[t.id] || 0) + q; prefilled = true; }
       });
+      if (prefilled) prefillSrc = "briffetools";
+      else if (p.pax > 0) {
+        const inPack = (t) => {
+          if (!preselTags.length) return true; // aucun pack mappé -> tout le matériel doté
+          const tgs = t.tags || [];
+          return tgs.some((x) => preselTags.includes(x)) || tgs.some((x) => baseTags.includes(x));
+        };
+        types.forEach((t) => {
+          const fixe = t.dotation_fixe || 0, perPax = t.dotation_pax || 0;
+          if ((fixe > 0 || perPax > 0) && inPack(t)) {
+            const q = fixe + (perPax > 0 ? Math.ceil(p.pax / perPax) : 0);
+            if (q > 0) { counts[t.id] = q; prefilled = true; }
+          }
+        });
+        if (prefilled) prefillSrc = "dotation";
+      }
     }
     const byCode = {};
     types.forEach((t) => { if (t.code_qr) byCode[t.code_qr.trim()] = t; });
@@ -970,7 +1028,7 @@
           ${allTags.map((tg) => { const on = preselTags.includes(tg.nom); return `<button type="button" class="tagf" data-tag="${esc(tg.nom)}" data-on="${on ? "1" : "0"}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
         </div>` : ""}
 
-        ${prefilled ? `<div class="card" style="background:#eef7ee;border-color:var(--green)"><div class="sub" style="color:var(--green-d)">✨ Quantités <b>pré-remplies</b> d'après la dotation pour <b>${p.pax} pers.</b> — vérifie et ajuste avant de valider.</div></div>` : ""}
+        ${prefilled ? `<div class="card" style="background:#eef7ee;border-color:var(--green)"><div class="sub" style="color:var(--green-d)">✨ Quantités <b>pré-remplies</b> ${prefillSrc === "briffetools" ? "d'après la préparation briffetools" : `d'après la dotation pour <b>${p.pax} pers.</b>`} — vérifie et ajuste avant de valider.</div></div>` : ""}
         <div class="section-title">Matériel ${verb}</div>
         <div class="list" id="qty-card">
           ${Object.keys(byCat).sort().map((cat) => `
@@ -3034,7 +3092,7 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
         </div>
         <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
         <button class="btn ghost block" id="logout">Se déconnecter</button>
-        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.5</div>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.6</div>
       </main>`;
     $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
   }
