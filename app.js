@@ -250,6 +250,16 @@
     const cls = { en_cours: "gray", a_quai: "blue", en_livraison: "amber", a_recuperer: "amber", recupere: "green", livre: "green", clos: "gray" }[s] || "gray";
     return `<span class="badge ${cls}">${esc(STATUT_LABEL[s] || s)}</span>`;
   };
+  // Badge d'origine de la prestation, selon prestations.source
+  const SOURCE_BADGE = {
+    sextan: { label: "Sextan", cls: "blue" },
+    briffetools: { label: "briffetools", cls: "green" },
+  };
+  const srcBadge = (src, small) => {
+    const b = SOURCE_BADGE[src] || { label: "Ajout manuel", cls: "gray" };
+    const sz = small ? ' style="font-size:10px;padding:1px 6px"' : "";
+    return `<span class="badge ${b.cls}"${sz}>${b.label}</span>`;
+  };
 
   // Normalisation pour recherche (sans accents ni casse)
   function _norm(s) { return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
@@ -352,7 +362,7 @@
             <h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>
             ${prestaBadge(p.statut)}
           </div>
-          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")}${p.source === "sextan" ? ` · <span class="badge blue" style="font-size:10px;padding:1px 6px">Sextan</span>` : ""}</div>
+          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${srcBadge(p.source, true)}</div>
           ${tg.length ? `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:5px">${tg.map((t) => `<span class="badge green" style="font-size:10px;padding:1px 7px">${esc(t)}</span>`).join("")}</div>` : ""}
         </div>
         <div style="font-size:22px;color:#cbd5c9">›</div>
@@ -705,6 +715,7 @@
           reference: $("#f-ref").value.trim() || null,
           pax: parseInt($("#f-pax").value) || null,
           notes: $("#f-notes").value.trim() || null,
+          source: "manuel",
           created_by: state.user.id,
         })
         .select()
@@ -788,6 +799,7 @@
             <div class="grow">
               <h3 style="cursor:pointer" ${p.client_id ? `onclick="location.hash='#/client/${p.client_id}'"` : ""}>${esc(p.clients ? p.clients.nom : "Client ?")}</h3>
               <div class="sub">${p.clients ? (p.clients.type_client === "fixe" ? "Client fixe · " : "Client ponctuel · ") : ""}${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}${p.pax ? " · " + p.pax + " pers." : ""}</div>
+              <div style="margin-top:6px">${srcBadge(p.source, true)}</div>
             </div>
             ${prestaBadge(p.statut)}
           </div>
