@@ -588,6 +588,7 @@
     const card = (p) => {
       const fs = openByP[p.id];
       const total = fs.reduce((s, f) => s + amount(f), 0);
+      const sent = !!p.recap_envoye_at;
       return `<div class="card">
         <div class="row between">
           <div class="grow"><b>${esc(p.libelle || p.reference || "Prestation")}</b>
@@ -595,9 +596,10 @@
           <span class="badge red">${eur(total)}</span>
         </div>
         <div class="sub" style="margin-top:6px">${fs.map((f) => `${f.quantite}× ${esc(tname[f.type_id] || "Matériel")} · ${esc(f.motif)}`).join("<br>")}</div>
+        ${sent ? `<div class="badge" style="margin-top:8px;background:var(--green-soft, #e6f1e3);color:var(--green-d, #1f5c2a)">✉️ Récap envoyé le ${dfr(String(p.recap_envoye_at).slice(0,10))}</div>` : ""}
         <div class="btn-grid" style="margin-top:10px">
           <button class="btn sec" onclick="location.hash='#/prestation/${p.id}/manquants'">📊 Détail</button>
-          <button class="btn sec" data-mail="${p.id}">✉️ Récap mail</button>
+          <button class="btn sec" data-mail="${p.id}">✉️ ${sent ? "Renvoyer le récap" : "Récap mail"}</button>
           <button class="btn" data-arch="${p.id}">✅ Traité — archiver</button>
         </div>
       </div>`;
@@ -655,8 +657,9 @@
         });
         const out = await res.json().catch(() => ({}));
         if (!res.ok || out.error) throw new Error(out.error || ("HTTP " + res.status));
+        await sb.from("prestations").update({ recap_envoye_at: new Date().toISOString() }).eq("id", p.id);
         toast("Récap envoyé" + (out.to ? " à " + out.to : "") + " ✔", "ok");
-        b.disabled = false; b.textContent = old;
+        render();
       } catch (e) {
         b.disabled = false; b.textContent = "✉️ Réessayer";
         toast("Envoi impossible : " + (e.message || e), "err");
@@ -789,6 +792,7 @@
             ${prestaBadge(p.statut)}
           </div>
           ${p.notes ? `<div class="divider"></div><div class="sub">${esc(p.notes)}</div>` : ""}
+          ${p.recap_envoye_at ? `<div class="badge" style="margin-top:10px;background:var(--green-soft, #e6f1e3);color:var(--green-d, #1f5c2a)">✉️ Récap écart envoyé le ${dfr(String(p.recap_envoye_at).slice(0,10))}</div>` : ""}
         </div>
 
         <div class="stat">
@@ -1426,22 +1430,10 @@
       const archived = await maybeAutoArchive(id);
       if (!archived) await sb.from("prestations").update({ archivee: false }).eq("id", id);
 
-      // Email au service compta si des manquants
+      // Pas d'email généré côté livreur : l'écart part dans « Écarts à traiter »,
+      // et l'admin envoie le récap (adresse GreenLoop) via le bouton « Récap mail ».
       if (manquantsTxt.length) {
-        const compta = await db.param("email_compta");
-        const cli = p.clients ? p.clients.nom : "Client ?";
-        const total = facts.reduce((s, f) => s + f.quantite * f.prix_unitaire, 0);
-        const body =
-`Prestation : ${p.libelle || ""}
-Client : ${cli}
-Date : ${dfr(p.date_presta)}
-
-Matériel non récupéré à facturer :
-${manquantsTxt.join("\n")}
-
-Total : ${eur(total)} HT`;
-        if (compta) openMail(compta, `Matériel à facturer — ${cli} (${p.libelle || ""})`, body);
-        else toast("Écart enregistré → onglet « Écarts à traiter ».", "ok");
+        toast("Écart enregistré → onglet « Écarts à traiter »", "ok");
       } else {
         toast(archived ? "Récupération soldée — prestation archivée ✔" : "Récupération complète ✔", "ok");
       }
