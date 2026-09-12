@@ -2582,6 +2582,7 @@ Total : ${eur(total)} HT`;
     const cli = p.clients || {};
     const lieu = p.lieu_livraison || cli.adresse_livraison || cli.adresse || "";
     const bl = p.reference || p.ext_ref || "";
+    const pax = p.pax ? (p.pax + " pers.") : "";
     const url = location.origin + location.pathname + "#/prestation/" + id;
     const plabelCss = `
       <style>
@@ -2590,9 +2591,9 @@ Total : ${eur(total)} HT`;
           padding:3mm;display:flex;flex-direction:column;align-items:center;text-align:center;background:#fff;color:#111}
         .plabel .pcli{font-weight:800;font-size:13px;line-height:1.15;margin-bottom:1mm}
         .plabel .plieu{font-size:11px;line-height:1.2;margin-bottom:1mm}
+        .plabel .pbig{font-weight:800;font-size:26px;line-height:1;margin-bottom:1mm;word-break:break-all}
         .plabel .pmeta{font-size:11px;font-weight:700;margin-bottom:2mm}
-        .plabel canvas,.plabel img{width:34mm !important;height:34mm !important}
-        .plabel .pbl{font-family:monospace;font-size:10px;margin-top:1mm;word-break:break-all}
+        .plabel canvas,.plabel img{width:30mm !important;height:30mm !important}
         @media print{
           .plabels{display:block;margin:0}
           .plabel{width:62mm;border:0;border-radius:0;page-break-after:always;break-after:page;padding:3mm}
@@ -2639,23 +2640,23 @@ Total : ${eur(total)} HT`;
         `<div class="lbl">` +
         `<div class="cli">${esc(cli.nom || p.libelle || "Prestation")}</div>` +
         (lieu ? `<div class="lieu">${esc(lieu)}</div>` : "") +
-        `<div class="meta">${esc(dateStr)}${bl ? " · N° " + esc(bl) : ""}</div>` +
+        (bl ? `<div class="big">${esc(bl)}</div>` : "") +
+        `<div class="meta">${esc(dateStr)}${pax ? " · " + esc(pax) : ""}</div>` +
         (qr ? `<img src="${qr}" alt="">` : "") +
-        (bl ? `<div class="bl">${esc(bl)}</div>` : "") +
         `</div>`;
       let body = ""; for (let i = 0; i < n; i++) body += one;
       const doc =
         `<!doctype html><html><head><meta charset="utf-8"><title>Étiquettes</title><style>` +
-        `@page{size:62mm 64mm;margin:0}` +
+        `@page{size:62mm 70mm;margin:0}` +
         `*{box-sizing:border-box}html,body{margin:0;padding:0}` +
         `body{font-family:system-ui,-apple-system,Arial,sans-serif;color:#000}` +
-        `.lbl{width:62mm;height:64mm;overflow:hidden;padding:2mm;text-align:center;page-break-after:always;break-after:page;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.5mm}` +
+        `.lbl{width:62mm;height:70mm;overflow:hidden;padding:2mm;text-align:center;page-break-after:always;break-after:page;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.5mm}` +
         `.lbl:last-child{page-break-after:auto;break-after:auto}` +
         `.cli{font-weight:800;font-size:12px;line-height:1.1}` +
         `.lieu{font-size:10px;line-height:1.15;margin:0.5mm 0}` +
-        `.meta{font-weight:700;font-size:10px;margin-bottom:1mm}` +
-        `.lbl img{width:30mm;height:30mm;display:block}` +
-        `.bl{font-family:monospace;font-size:9px;margin-top:0.5mm;word-break:break-all}` +
+        `.big{font-weight:800;font-size:28px;line-height:1;margin:0.5mm 0;word-break:break-all}` +
+        `.meta{font-weight:700;font-size:11px;margin-bottom:1mm}` +
+        `.lbl img{width:28mm;height:28mm;display:block}` +
         `</style></head><body>${body}</body></html>`;
       const ifr = document.createElement("iframe");
       ifr.setAttribute("aria-hidden", "true");
@@ -2685,26 +2686,31 @@ Total : ${eur(total)} HT`;
       return lines;
     };
     const makeLabelCanvas = (cb) => {
-      const S = 10, W = 62 * S, padX = 26, padY = 26, maxW = W - padX * 2, qrSize = 360;
+      const S = 10, W = 62 * S, padX = 22, padY = 24, maxW = W - padX * 2, qrSize = 300;
       const tmp = document.createElement("div");
       new QRCode(tmp, { text: url, width: qrSize, height: qrSize, correctLevel: QRCode.CorrectLevel.M });
       const qrEl = tmp.querySelector("canvas") || tmp.querySelector("img");
       const mctx = document.createElement("canvas").getContext("2d");
-      mctx.font = "700 32px system-ui,Arial"; const cliLines = wrapText(mctx, cli.nom || p.libelle || "Prestation", maxW);
+      mctx.font = "700 30px system-ui,Arial"; const cliLines = wrapText(mctx, cli.nom || p.libelle || "Prestation", maxW);
       mctx.font = "24px system-ui,Arial"; const lieuLines = lieu ? wrapText(mctx, lieu, maxW) : [];
-      let h = padY + cliLines.length * 38 + 6 + lieuLines.length * 30 + 6 + 36 + 14 + qrSize + 16 + (bl ? 26 : 0) + padY;
+      // Taille du n° de BL : gros, réduit seulement si trop large pour l'étiquette.
+      let blFont = 88;
+      if (bl) { mctx.font = "800 " + blFont + "px system-ui,Arial"; while (blFont > 40 && mctx.measureText(bl).width > maxW) { blFont -= 4; mctx.font = "800 " + blFont + "px system-ui,Arial"; } }
+      const blBlock = bl ? (blFont + 16) : 0;
+      let h = padY + cliLines.length * 36 + 4 + lieuLines.length * 30 + 8 + blBlock + 34 + 16 + qrSize + padY;
       const cv = document.createElement("canvas"); cv.width = W; cv.height = Math.round(h);
       const ctx = cv.getContext("2d");
       ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, cv.height);
-      ctx.fillStyle = "#111"; ctx.textAlign = "center";
+      ctx.textAlign = "center";
       const finish = () => {
-        let y = padY + 32;
-        ctx.font = "700 32px system-ui,Arial"; cliLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 38; });
-        y += 6; ctx.font = "24px system-ui,Arial"; ctx.fillStyle = "#333"; lieuLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 30; });
-        y += 4; ctx.fillStyle = "#111"; ctx.font = "700 24px system-ui,Arial";
-        ctx.fillText(dateStr + (bl ? " · N° " + bl : ""), W / 2, y); y += 30;
-        if (qrEl) { try { ctx.drawImage(qrEl, (W - qrSize) / 2, y, qrSize, qrSize); } catch (e) {} y += qrSize + 20; }
-        if (bl) { ctx.font = "18px monospace"; ctx.fillStyle = "#444"; ctx.fillText(bl, W / 2, y); }
+        let y = padY + 30;
+        ctx.fillStyle = "#111"; ctx.font = "700 30px system-ui,Arial"; cliLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 36; });
+        y += 4; ctx.fillStyle = "#333"; ctx.font = "24px system-ui,Arial"; lieuLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 30; });
+        y += 8;
+        if (bl) { ctx.fillStyle = "#000"; ctx.font = "800 " + blFont + "px system-ui,Arial"; ctx.fillText(bl, W / 2, y + Math.round(blFont * 0.8)); y += blBlock; }
+        ctx.fillStyle = "#111"; ctx.font = "700 24px system-ui,Arial"; ctx.fillText(dateStr + (pax ? " · " + pax : ""), W / 2, y + 22); y += 34;
+        y += 16;
+        if (qrEl) { try { ctx.drawImage(qrEl, (W - qrSize) / 2, y, qrSize, qrSize); } catch (e) {} }
         cb(cv);
       };
       if (qrEl && qrEl.tagName === "IMG" && !qrEl.complete) qrEl.onload = finish; else finish();
@@ -2743,10 +2749,10 @@ Total : ${eur(total)} HT`;
         div.insertAdjacentHTML("beforeend",
           `<div class="pcli">${esc(cli.nom || p.libelle || "Prestation")}</div>` +
           (lieu ? `<div class="plieu">📍 ${esc(lieu)}</div>` : "") +
-          `<div class="pmeta">${esc(dateStr)}${bl ? " · N° " + esc(bl) : ""}</div>`);
+          (bl ? `<div class="pbig">${esc(bl)}</div>` : "") +
+          `<div class="pmeta">${esc(dateStr)}${pax ? " · " + esc(pax) : ""}</div>`);
         const qr = document.createElement("div");
         div.appendChild(qr);
-        if (bl) div.insertAdjacentHTML("beforeend", `<div class="pbl">${esc(bl)}</div>`);
         box.appendChild(div);
         new QRCode(qr, { text: url, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
       }
