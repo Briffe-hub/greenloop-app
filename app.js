@@ -2610,9 +2610,12 @@ Total : ${eur(total)} HT`;
             <input id="nb" type="number" value="2" min="1" max="50" />
             <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
           </div>
-          <button class="btn block" id="btn-print" style="margin-top:10px">🖨️ Imprimer les étiquettes</button>
-          <button class="btn sec block" id="dl-png" style="margin-top:8px">📥 Enregistrer en image (dépannage)</button>
-          <div class="sub" style="margin-top:8px">Imprimante <b>Brother QL-810W</b>, rouleau continu <b>62 mm</b>. Au moment d'imprimer, choisis la Brother et le papier <b>« 62mm »</b>.<br>⚠️ Sur Android, le <b>service d'impression</b> doit être activé (Réglages → Impression). Si l'impression système refuse, utilise « Enregistrer en image » puis l'app <b>Brother iPrint&amp;Label</b>.</div>
+          <button class="btn block" id="btn-share" style="margin-top:10px">📤 Partager / Imprimer l'étiquette</button>
+          <div class="btn-grid" style="margin-top:8px">
+            <button class="btn sec" id="btn-print">🖨️ Imprimer (PC)</button>
+            <button class="btn sec" id="dl-png">📥 Enregistrer l'image</button>
+          </div>
+          <div class="sub" style="margin-top:8px">📱 <b>Sur iPad / mobile</b> : utilise <b>« Partager / Imprimer l'étiquette »</b> → dans le partage, choisis <b>Imprimer</b> (ou l'app Brother). Ça imprime une <b>image</b> : pas d'en-tête, pas de surlongueur. Dans la fenêtre d'impression, choisis bien le papier <b>62 mm</b>.<br>🖥️ <b>Sur PC</b> : le bouton « Imprimer » suffit.</div>
           ${!lieu ? `<div class="sub" style="margin-top:8px;color:var(--danger)">⚠️ Aucun lieu de livraison sur cette prestation. Ajoute-le via « Modifier » ou dans la fiche client.</div>` : ""}
         </div>
         <div class="plabels" id="plabels"></div>
@@ -2681,7 +2684,7 @@ Total : ${eur(total)} HT`;
       if (line) lines.push(line);
       return lines;
     };
-    const downloadLabelPNG = () => {
+    const makeLabelCanvas = (cb) => {
       const S = 10, W = 62 * S, padX = 26, padY = 26, maxW = W - padX * 2, qrSize = 360;
       const tmp = document.createElement("div");
       new QRCode(tmp, { text: url, width: qrSize, height: qrSize, correctLevel: QRCode.CorrectLevel.M });
@@ -2702,14 +2705,33 @@ Total : ${eur(total)} HT`;
         ctx.fillText(dateStr + (bl ? " · N° " + bl : ""), W / 2, y); y += 30;
         if (qrEl) { try { ctx.drawImage(qrEl, (W - qrSize) / 2, y, qrSize, qrSize); } catch (e) {} y += qrSize + 20; }
         if (bl) { ctx.font = "18px monospace"; ctx.fillStyle = "#444"; ctx.fillText(bl, W / 2, y); }
-        const data = cv.toDataURL("image/png");
-        const a = document.createElement("a");
-        a.href = data; a.download = "etiquette-" + String(bl || id).replace(/[^\w-]+/g, "_") + ".png";
-        document.body.appendChild(a); a.click(); a.remove();
+        cb(cv);
       };
       if (qrEl && qrEl.tagName === "IMG" && !qrEl.complete) qrEl.onload = finish; else finish();
     };
-    $("#dl-png").onclick = downloadLabelPNG;
+    const fileName = () => "etiquette-" + String(bl || id).replace(/[^\w-]+/g, "_") + ".png";
+    const downloadLabelPNG = () => makeLabelCanvas((cv) => {
+      const a = document.createElement("a");
+      a.href = cv.toDataURL("image/png"); a.download = fileName();
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+    // Partage de l'image (Web Share) — voie fiable sur iPad/mobile : imprimer une
+    // IMAGE évite l'en-tête/pied de Safari et la surlongueur (Safari ignore @page).
+    const shareLabelPNG = () => makeLabelCanvas((cv) => {
+      cv.toBlob((blob) => {
+        if (!blob) return downloadLabelPNG();
+        const file = new File([blob], fileName(), { type: "image/png" });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          navigator.share({ files: [file], title: "Étiquette" }).catch(() => {});
+        } else {
+          const w = window.open("", "_blank");
+          if (w) { w.document.write('<title>Étiquette</title><img src="' + cv.toDataURL("image/png") + '" style="width:62mm;display:block">'); w.document.close(); }
+          else downloadLabelPNG();
+        }
+      }, "image/png");
+    });
+    if ($("#dl-png")) $("#dl-png").onclick = downloadLabelPNG;
+    if ($("#btn-share")) $("#btn-share").onclick = shareLabelPNG;
 
     const dateStr = dfr(p.date_presta);
     const draw = () => {
