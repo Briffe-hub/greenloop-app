@@ -1,48 +1,3517 @@
-/* GreenLoop — Service Worker
-   Cache "app shell" pour l'installation PWA et un chargement rapide.
-   Les données (Supabase) ne sont pas mises en cache : toujours en réseau. */
-const CACHE = "greenloop-v11";
-const SHELL = [
-  "./",
-  "./index.html",
-  "./styles.css",
-  "./app.js",
-  "./config.js",
-  "./manifest.json",
-  "./icon-192.png",
-  "./icon-512.png",
-  "./lib/supabase.js",
-  "./lib/html5-qrcode.min.js",
-  "./lib/qrcode.min.js",
-];
+/* ===========================================================================
+   GreenLoop — Application (PWA vanilla JS + Supabase)
+   Traçabilité du matériel traiteur : sortie -> retour -> manquants -> facturation
+   =========================================================================== */
+(function () {
+  "use strict";
 
-self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
-});
+  // ---- Config / client Supabase ------------------------------------------
+  const CFG = window.GREENLOOP_CONFIG || {};
+  const CONFIGURED =
+    CFG.SUPABASE_URL &&
+    CFG.SUPABASE_ANON_KEY &&
+    !CFG.SUPABASE_URL.includes("VOTRE-PROJET") &&
+    !CFG.SUPABASE_ANON_KEY.includes("VOTRE_CLE");
 
-self.addEventListener("activate", (e) => {
-  e.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
-    ).then(() => self.clients.claim())
-  );
-});
+  let sb = null;
+  if (CONFIGURED && window.supabase) {
+    sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
+  }
 
-// Stratégie « réseau d'abord » : on récupère toujours la dernière version en
-// ligne (les mises à jour arrivent immédiatement), et on retombe sur le cache
-// uniquement hors-ligne. Les appels externes (Supabase) ne sont pas interceptés.
-self.addEventListener("fetch", (e) => {
-  const url = new URL(e.request.url);
-  if (url.origin !== location.origin) return;
-  e.respondWith(
-    // no-cache : on force la revalidation auprès du serveur pour éviter de servir
-    // un app.js périmé par le cache HTTP du navigateur.
-    fetch(e.request, { cache: "no-cache" })
-      .then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
-        return res;
-      })
-      .catch(() => caches.match(e.request))
-  );
-});
+  // ---- État global --------------------------------------------------------
+  const state = { user: null, profile: null };
+  const isAdmin = () => state.profile && state.profile.role === "admin";
+
+  const MOTIF_LABEL = {
+    initial: "Parc initial", rachat: "Rachat", perte: "Perte (non retrouvé)",
+    casse_salarie: "Casse salarié", inventaire: "Correction d'inventaire", autre: "Autre",
+  };
+
+  // Recalcule le parc = somme des deltas du journal, et le met à jour sur le type
+  async function recomputeStock(typeId) {
+    const rows = await db.parcJournal(typeId);
+    const total = rows.reduce((a, r) => a + (r.delta || 0), 0);
+    await sb.from("materiel_types").update({ stock_total: total }).eq("id", typeId);
+    return total;
+  }
+  // Archive automatiquement une prestation terminée s'il n'y a rien à facturer
+  // (aucune casse/perte/manquant en attente). Renvoie true si archivée.
+  async function maybeAutoArchive(id) {
+    const { count } = await sb.from("facturations")
+      .select("id", { count: "exact", head: true })
+      .eq("prestation_id", id).eq("statut", "a_facturer");
+    if ((count || 0) === 0) {
+      await sb.from("prestations").update({ archivee: true }).eq("id", id);
+      return true;
+    }
+    return false;
+  }
+
+  // Libellé de journée relatif (Aujourd'hui / Demain / Hier / date longue)
+  function dayLabel(iso) {
+    if (!iso || iso === "zzz") return "Sans date";
+    const d = new Date(iso + "T00:00:00");
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const diff = Math.round((d - today) / 86400000);
+    const full = d.toLocaleDateString("fr-FR", { weekday: "long", day: "2-digit", month: "short" });
+    const rel = diff === 0 ? "Aujourd'hui" : diff === 1 ? "Demain" : diff === -1 ? "Hier" : null;
+    return rel ? `${rel} · ${full}` : full;
+  }
+
+  // Date+heure courtes
+  const dfrt = (iso) => {
+    try { return new Date(iso).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "2-digit", hour: "2-digit", minute: "2-digit" }); }
+    catch (e) { return iso; }
+  };
+
+  // ---- Raccourcis DOM -----------------------------------------------------
+  const app = document.getElementById("app");
+  const nav = document.getElementById("nav");
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const esc = (s) =>
+    String(s ?? "").replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+    );
+  const eur = (n) => (Number(n) || 0).toFixed(2).replace(".", ",") + " €";
+  const dfr = (d) =>
+    d ? new Date(d + "T00:00:00").toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "numeric" }) : "—";
+
+  function toast(msg, kind = "") {
+    const t = document.createElement("div");
+    t.className = "toast " + kind;
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 2600);
+  }
+  const spinner = '<div class="spinner"></div>';
+
+  // ---- Couches d'accès données -------------------------------------------
+  const db = {
+    async q(table, cb) {
+      let query = sb.from(table).select("*");
+      if (cb) query = cb(query);
+      const { data, error } = await query;
+      if (error) throw error;
+      return data;
+    },
+    clients: () => db.q("clients", (q) => q.eq("actif", true).order("nom")),
+    client: async (id) => {
+      const { data, error } = await sb.from("clients").select("*").eq("id", id).single();
+      if (error) throw error;
+      return data;
+    },
+    soldeClient: (cid) => db.q("v_solde_client", (q) => q.eq("client_id", cid)),
+    soldeAll: () => db.q("v_solde_client"),
+    categories: () => db.q("materiel_categories", (q) => q.order("nom")),
+    tags: () => db.q("materiel_tags", (q) => q.order("is_base", { ascending: false }).order("nom")),
+    typeTagMap: () => db.q("sextan_type_tags"),
+    prestationsByClient: (cid) =>
+      db.q("prestations", (q) => q.eq("client_id", cid).order("date_presta", { ascending: false })),
+    param: async (cle) => {
+      const { data } = await sb.from("parametres").select("valeur").eq("cle", cle).maybeSingle();
+      return data ? data.valeur : "";
+    },
+    setParam: (cle, valeur) => sb.from("parametres").upsert({ cle, valeur }),
+    types: () => db.q("materiel_types", (q) => q.eq("actif", true).order("categorie").order("nom")),
+    typesArchived: () => db.q("materiel_types", (q) => q.eq("actif", false).order("nom")),
+    parcJournal: (tid) => db.q("parc_journal", (q) => q.eq("type_id", tid).order("created_at", { ascending: false })),
+    movementsByType: async (tid) => {
+      const { data, error } = await sb.from("mouvements")
+        .select("*, prestations(libelle, date_presta, clients(nom))")
+        .eq("type_id", tid).order("created_at", { ascending: false });
+      if (error) throw error;
+      return data;
+    },
+    usersList: () => db.q("profiles", (q) => q.order("nom")),
+    type: async (id) => {
+      const { data, error } = await sb.from("materiel_types").select("*").eq("id", id).single();
+      if (error) throw error;
+      return data;
+    },
+    typeByCode: async (code) => {
+      const { data, error } = await sb
+        .from("materiel_types")
+        .select("*")
+        .eq("code_qr", code.trim())
+        .maybeSingle();
+      if (error) throw error;
+      return data;
+    },
+    prestations: () =>
+      db.q("prestations", (q) => q.order("date_presta", { ascending: false }).order("created_at", { ascending: false })),
+    prestation: async (id) => {
+      const { data, error } = await sb
+        .from("prestations")
+        .select("*, clients(*)")
+        .eq("id", id)
+        .single();
+      if (error) throw error;
+      return data;
+    },
+    mouvements: (pid) =>
+      db.q("mouvements", (q) =>
+        q.eq("prestation_id", pid)
+      ).then((rows) => rows),
+    bilan: (pid) => db.q("v_bilan_manquants", (q) => q.eq("prestation_id", pid)),
+    facturations: (pid) => db.q("facturations", (q) => q.eq("prestation_id", pid).order("created_at")),
+    facturationsOpen: () => db.q("facturations", (q) => q.eq("statut", "a_facturer").not("prestation_id", "is", null)),
+    prestationsTerminees: () => db.q("prestations", (q) => q.in("statut", ["recupere", "livre"]).eq("archivee", false)),
+  };
+
+  // =========================================================================
+  //  ROUTEUR
+  // =========================================================================
+  const routes = {};
+  function route(path, fn) { routes[path] = fn; }
+
+  function parseHash() {
+    const raw = (location.hash || "#/prestations").slice(1);
+    return raw.split("/").filter(Boolean); // ex: ["prestation","abc","sortie"]
+  }
+
+  // Mémoire de défilement par écran (#hash) : permet de revenir à la liste
+  // exactement là où on l'avait quittée (ex. après avoir ouvert une prestation).
+  const scrollMem = {};
+  let curHash = location.hash || "#/prestations";
+  function restoreScroll() {
+    const y = scrollMem[location.hash];
+    requestAnimationFrame(() => { try { window.scrollTo(0, y || 0); } catch (_e) {} });
+  }
+
+  async function render() {
+    if (!state.user) return; // géré par renderAuth
+    // On sauvegarde la position de l'écran qu'on quitte AVANT de remplacer le DOM.
+    try { scrollMem[curHash] = window.scrollY; } catch (_e) {}
+    curHash = location.hash || "#/prestations";
+    const parts = parseHash();
+    const head = parts[0] || "prestations";
+    setNav(head);
+    app.innerHTML = spinner;
+    try {
+      if (head === "prestations" && parts.length === 1) return viewPrestations();
+      if (head === "prestation") {
+        const id = parts[1];
+        const sub = parts[2];
+        if (sub === "sortie") return viewFlux(id, "sortie");
+        if (sub === "retour") return viewFlux(id, "retour");
+        if (sub === "recuperation") return viewRecuperation(id);
+        if (sub === "manquants") return viewManquants(id);
+        if (sub === "edit") return viewPrestaEdit(id);
+        if (sub === "labels") return viewPrestaLabels(id);
+        return viewPrestationDetail(id);
+      }
+      if (head === "scan") return viewScan();
+      if (head === "nouvelle-presta") return viewPrestaForm();
+      if (head === "materiel" && parts.length === 1) return viewMateriel();
+      if (head === "ecarts") return viewEcarts();
+      if (head === "archivees") return viewArchivesPresta();
+      if (head === "archives") return viewArchives();
+      if (head === "categories") return viewCategories();
+      if (head === "tags") return viewTags();
+      if (head === "masse") return viewMasse();
+      if (head === "journal") return viewParcJournal(parts[1]);
+      if (head === "admin") return viewAdmin();
+      if (head === "type") return viewTypeDetail(parts[1]);
+      if (head === "etiquettes") return viewEtiquettes(parts[1]);
+      if (head === "clients") return viewClients();
+      if (head === "client") {
+        if (parts[1] === "new") return viewClientForm("new");
+        if (parts[2] === "edit") return viewClientForm(parts[1]);
+        if (parts[2] === "retard") return viewRetardClient(parts[1]);
+        return viewClientDetail(parts[1]);
+      }
+      if (head === "parametres") return viewParametres();
+      if (head === "compte") return viewCompte();
+      go("prestations");
+    } catch (e) {
+      console.error(e);
+      app.innerHTML = topbar("Erreur") + `<main><div class="card"><p>${esc(e.message || e)}</p></div></main>`;
+    }
+  }
+
+  function go(path) { location.hash = "#/" + path; }
+  function setNav(head) {
+    nav.classList.toggle("hidden", false);
+    $$("#nav button").forEach((b) => b.classList.toggle("active", b.dataset.route === head));
+  }
+  nav.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (b) go(b.dataset.route);
+  });
+  window.addEventListener("hashchange", render);
+
+  // ---- Fragments UI communs ----------------------------------------------
+  function topbar(title, opts = {}) {
+    const back = opts.back
+      ? `<button class="back" onclick="history.length>1?history.back():(location.hash='#/${opts.back}')">‹ Retour</button>`
+      : "";
+    const act = opts.action
+      ? `<button class="act" id="tb-action">${esc(opts.action)}</button>`
+      : "";
+    return `<div class="topbar">${back}<h1>${esc(title)}</h1>${act}</div>`;
+  }
+  const STATUT_LABEL = {
+    en_cours: "En préparation",
+    a_quai: "À quai – prêt à livrer",
+    en_livraison: "En cours de livraison",
+    a_recuperer: "Livré – à récupérer",
+    recupere: "Récupéré",
+    livre: "Livré",
+    clos: "Clos",
+  };
+  const prestaBadge = (s) => {
+    const cls = { en_cours: "gray", a_quai: "blue", en_livraison: "amber", a_recuperer: "amber", recupere: "green", livre: "green", clos: "gray" }[s] || "gray";
+    return `<span class="badge ${cls}">${esc(STATUT_LABEL[s] || s)}</span>`;
+  };
+  // Badge d'origine de la prestation, selon prestations.source
+  const SOURCE_BADGE = {
+    sextan: { label: "Sextan", cls: "blue" },
+    briffetools: { label: "briffetools", cls: "green" },
+  };
+  const srcBadge = (src, small) => {
+    const b = SOURCE_BADGE[src] || { label: "Ajout manuel", cls: "gray" };
+    const sz = small ? ' style="font-size:10px;padding:1px 6px"' : "";
+    return `<span class="badge ${b.cls}"${sz}>${b.label}</span>`;
+  };
+
+  // Normalisation pour recherche (sans accents ni casse)
+  function _norm(s) { return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
+
+  // Style d'une "puce" tag (on/off) — inline pour éviter une dépendance CSS à déployer
+  function chipCss(on) {
+    return `border:1px solid ${on ? "var(--green)" : "var(--line)"};background:${on ? "#dcfce7" : "#fff"};`
+      + `color:${on ? "var(--green-d)" : "var(--muted)"};padding:8px 13px;border-radius:999px;font-size:13px;font-weight:700;cursor:pointer`;
+  }
+
+  // Sélecteur de client réutilisable : recherche par nom + filtre Fixe/Ponctuel.
+  // Écrit l'id choisi dans un input caché #f-client (compatible avec le code existant).
+  function clientPickerHtml(clients, selectedId) {
+    const sel = clients.find((c) => c.id === selectedId);
+    return `
+      <div class="picker" style="position:relative">
+        <input type="hidden" id="f-client" value="${selectedId || ""}" />
+        <input id="cli-search" autocomplete="off" placeholder="Taper le nom du client…" value="${sel ? esc(sel.nom) : ""}" />
+        <div class="seg" id="cli-typeseg" style="margin-top:6px">
+          <button type="button" data-t="" class="active">Tous</button>
+          <button type="button" data-t="fixe">Fixes</button>
+          <button type="button" data-t="ponctuel">Ponctuels</button>
+        </div>
+        <div id="cli-results" class="hidden" style="border:1px solid var(--line);border-radius:11px;margin-top:6px;max-height:260px;overflow:auto;background:#fff"></div>
+      </div>`;
+  }
+  function clientPickerWire(clients) {
+    const search = $("#cli-search"), results = $("#cli-results"), hidden = $("#f-client"), seg = $("#cli-typeseg");
+    if (!search) return;
+    let typeFilter = "";
+    const rowStyle = "display:flex;align-items:center;gap:10px;padding:11px 12px;border-bottom:1px solid var(--line);cursor:pointer";
+    const render = () => {
+      const q = _norm(search.value.trim());
+      let list = clients.filter((c) => !typeFilter || c.type_client === typeFilter);
+      if (q) list = list.filter((c) => _norm(c.nom).includes(q) || _norm(c.categorie).includes(q) || _norm(c.groupe).includes(q));
+      const total = list.length;
+      list = list.slice(0, 60);
+      results.innerHTML = total
+        ? list.map((c) => `<div class="picker-row" data-id="${c.id}" style="${rowStyle}">
+             <div class="grow"><b>${esc(c.nom)}</b>${c.categorie ? `<small style="color:var(--muted)"> · ${esc(c.categorie)}</small>` : ""}</div>
+             <span class="badge ${c.type_client === "fixe" ? "green" : "gray"}">${c.type_client === "fixe" ? "Fixe" : "Ponctuel"}</span>
+           </div>`).join("") + (total > 60 ? `<div style="padding:10px 12px;color:var(--muted);font-size:13px">… affine ta recherche (${total} résultats)</div>` : "")
+        : `<div style="padding:12px;color:var(--muted)">Aucun client trouvé</div>`;
+      results.classList.remove("hidden");
+    };
+    search.onfocus = render;
+    search.oninput = () => { hidden.value = ""; render(); };
+    search.onblur = () => setTimeout(() => results.classList.add("hidden"), 200);
+    seg.onmousedown = (e) => e.preventDefault(); // garder le focus sur la recherche
+    seg.querySelectorAll("button").forEach((b) => b.onclick = () => {
+      seg.querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active"); typeFilter = b.dataset.t;
+      render();
+    });
+    results.onmousedown = (e) => {
+      const row = e.target.closest(".picker-row[data-id]"); if (!row) return;
+      e.preventDefault(); // empêche le blur avant la sélection
+      const c = clients.find((x) => x.id === row.dataset.id); if (!c) return;
+      hidden.value = c.id; search.value = c.nom; results.classList.add("hidden");
+    };
+  }
+
+  // Remplit le menu « reprendre une adresse enregistrée » (#f-lieu-pick) depuis
+  // les adresses du client, et recopie le choix dans le champ texte #f-lieu.
+  async function loadAddrOptions(clientId) {
+    const sel = $("#f-lieu-pick"); if (!sel) return;
+    if (!clientId) { sel.innerHTML = '<option value="">— choisis d\'abord un client —</option>'; return; }
+    const { data } = await sb.from("client_adresses").select("*").eq("client_id", clientId).order("created_at");
+    const list = data || [];
+    sel.innerHTML = '<option value="">— reprendre une adresse enregistrée du client —</option>' +
+      list.map((a) => `<option value="${esc(a.adresse || "")}">${esc(a.libelle ? a.libelle + " — " : "")}${esc(a.adresse || "")}</option>`).join("");
+  }
+  function wireLieuPicker(getClientId, initialClientId) {
+    const sel = $("#f-lieu-pick"), txt = $("#f-lieu");
+    if (!sel) return;
+    let loadedFor = "INIT";
+    const reload = async () => {
+      const cid = (getClientId && getClientId()) || initialClientId || "";
+      if (cid !== loadedFor) { loadedFor = cid; await loadAddrOptions(cid); }
+    };
+    reload();
+    sel.addEventListener("mousedown", reload);
+    sel.addEventListener("change", () => { if (sel.value && txt) txt.value = sel.value; });
+  }
+
+  // Autocomplétion d'adresse via la Base Adresse Nationale (api-adresse.data.gouv.fr,
+  // publique, sans clé). Propose des adresses pendant la frappe, sans empêcher la
+  // saisie libre (adresses complexes forcées à la main).
+  function attachBAN(input) {
+    if (!input || input.dataset.ban) return;
+    input.dataset.ban = "1";
+    input.setAttribute("autocomplete", "off");
+    const wrap = document.createElement("div");
+    wrap.style.position = "relative";
+    input.parentNode.insertBefore(wrap, input);
+    wrap.appendChild(input);
+    const box = document.createElement("div");
+    box.style.cssText = "position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:60;background:#fff;border:1px solid var(--line);border-radius:11px;max-height:240px;overflow:auto;box-shadow:0 6px 20px rgba(0,0,0,.14);display:none";
+    wrap.appendChild(box);
+    let t = null, lastQ = "";
+    const hide = () => { box.style.display = "none"; };
+    const show = () => { if (box.childNodes.length) box.style.display = "block"; };
+    const fill = (feats) => {
+      box.innerHTML = "";
+      feats.forEach((f) => {
+        const label = f.properties && f.properties.label; if (!label) return;
+        const row = document.createElement("div");
+        row.textContent = label;
+        row.style.cssText = "padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer;font-size:14px";
+        row.onmousedown = (e) => { e.preventDefault(); input.value = label; hide(); input.dispatchEvent(new Event("change", { bubbles: true })); };
+        box.appendChild(row);
+      });
+      show();
+    };
+    const query = async () => {
+      const q = input.value.trim();
+      if (q.length < 3) { hide(); return; }
+      if (q === lastQ) return; lastQ = q;
+      try {
+        const r = await fetch("https://api-adresse.data.gouv.fr/search/?limit=5&autocomplete=1&q=" + encodeURIComponent(q));
+        if (!r.ok) return;
+        const j = await r.json();
+        if ((j.features || []).length) fill(j.features); else hide();
+      } catch (_e) { /* hors-ligne : la saisie libre reste possible */ }
+    };
+    input.addEventListener("input", () => { clearTimeout(t); t = setTimeout(query, 250); });
+    input.addEventListener("focus", () => { if (box.childNodes.length) show(); });
+    input.addEventListener("blur", () => setTimeout(hide, 200));
+  }
+
+  // =========================================================================
+  //  VUE : Liste des prestations
+  // =========================================================================
+  async function viewPrestations() {
+    const all = await db.prestations();
+    const list = all.filter((p) => !p.archivee);      // actives (les archivées ont leur écran dédié)
+    const cli = {};
+    (await db.clients()).forEach((c) => (cli[c.id] = c));
+
+    // Packs (tags) par type de prestation Sextan -> filtre par tag
+    const map = await db.typeTagMap();
+    const mapOf = {}; map.forEach((m) => (mapOf[m.sextan_type] = m.tags || []));
+    const tagsOf = (p) => (p.type_presta && mapOf[p.type_presta]) ? mapOf[p.type_presta] : [];
+
+    // Écarts à traiter : réservés aux admins
+    let nEcarts = 0;
+    if (isAdmin()) {
+      const opens = await db.facturationsOpen();
+      const ecartIds = new Set(opens.map((f) => f.prestation_id));
+      nEcarts = list.filter((p) => ["recupere", "livre"].includes(p.statut) && ecartIds.has(p.id)).length;
+    }
+
+    // Tags réellement présents parmi les prestations actives
+    const tagCount = {};
+    list.forEach((p) => tagsOf(p).forEach((t) => (tagCount[t] = (tagCount[t] || 0) + 1)));
+    const presentTags = Object.keys(tagCount).sort();
+
+    const admin = isAdmin();          // sélection multiple réservée aux admins
+    const selected = new Set();
+
+    const card = (p) => {
+      const tg = tagsOf(p);
+      return `
+      <div class="card tap" onclick="location.hash='#/prestation/${p.id}'">
+        ${admin ? `<input type="checkbox" class="psel" data-id="${p.id}" onclick="event.stopPropagation()" style="width:22px;height:22px;flex:0 0 auto;margin-right:8px;align-self:center" />` : ""}
+        <div class="grow">
+          <div class="row between">
+            <h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>
+            ${prestaBadge(p.statut)}
+          </div>
+          <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${srcBadge(p.source, true)}</div>
+          ${tg.length ? `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:5px">${tg.map((t) => `<span class="badge green" style="font-size:10px;padding:1px 7px">${esc(t)}</span>`).join("")}</div>` : ""}
+        </div>
+        <div style="font-size:22px;color:#cbd5c9">›</div>
+      </div>`;
+    };
+
+    app.innerHTML =
+      topbar("Prestations", { action: "🗄 Archives" }) +
+      `<main>
+        ${nEcarts ? `<button class="btn warn block" style="margin-bottom:12px" onclick="location.hash='#/ecarts'">⚠️ Écarts à traiter (${nEcarts})</button>` : ""}
+        ${presentTags.length ? `<div id="ptagf" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+          <button type="button" class="ptag" data-tag="" style="${chipCss(true)}">Tout (${list.length})</button>
+          ${presentTags.map((t) => `<button type="button" class="ptag" data-tag="${esc(t)}" style="${chipCss(false)}">${esc(t)} (${tagCount[t]})</button>`).join("")}
+        </div>` : ""}
+        <button class="btn sec block" id="pscan" style="margin-bottom:10px">📷 Scanner une étiquette de prestation</button>
+        <div class="row between" style="margin:2px 2px 10px">
+          <div class="sub">Par journée de livraison</div>
+          <button class="btn sm sec" id="psort" style="width:auto">📅 Plus proches d'abord ↑</button>
+        </div>
+        ${admin ? `<div class="sub" style="margin:0 2px 8px">☑︎ Coche des prestations pour les archiver en bloc.</div>` : ""}
+        <div id="plist"></div>
+        ${admin ? `<div id="pbulk" class="hidden" style="position:sticky;bottom:calc(84px + var(--safe-b));background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);margin-top:10px">
+          <div class="row between"><b id="pbulk-count">0 sélectionnée(s)</b><button class="btn sm ghost" id="pbulk-cancel" style="flex:0 0 auto">Annuler</button></div>
+          <div class="field-row">
+            <select id="pbulk-statut">${Object.keys(STATUT_LABEL).map((s) => `<option value="${s}" ${s === "livre" ? "selected" : ""}>${esc(STATUT_LABEL[s])}</option>`).join("")}</select>
+            <button class="btn sm sec" id="pbulk-mark" style="flex:0 0 auto">Marquer</button>
+          </div>
+          <button class="btn" id="pbulk-arch">🗄 Archiver (0)</button>
+        </div>` : ""}
+      </main>
+      <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
+
+    if ($("#tb-action")) $("#tb-action").onclick = () => go("archivees");
+    if ($("#pscan")) $("#pscan").onclick = () => go("scan");
+
+    let activeTag = "";
+    let sortAsc = true; // true = plus proches d'abord
+    const byDate = (a, b) => {
+      const da = a.date_presta || "", db2 = b.date_presta || "";
+      if (!da && !db2) return 0;
+      if (!da) return 1;
+      if (!db2) return -1;
+      return (da < db2 ? -1 : da > db2 ? 1 : 0) * (sortAsc ? 1 : -1);
+    };
+    const draw = () => {
+      let l = activeTag ? list.filter((p) => tagsOf(p).includes(activeTag)) : list;
+      l = l.slice().sort(byDate);
+      // Regroupe par journée
+      const groups = {};
+      l.forEach((p) => ((groups[p.date_presta || "zzz"] ||= []).push(p)));
+      const keys = Object.keys(groups).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0) * (sortAsc ? 1 : -1));
+      $("#plist").innerHTML = l.length
+        ? keys.map((k) => `<div class="section-title">${esc(dayLabel(k))} <span style="color:var(--muted);font-weight:600">· ${groups[k].length}</span></div>${groups[k].map(card).join("")}`).join("")
+        : `<div class="empty"><div class="big">📋</div>Aucune prestation.</div>`;
+      if (admin) { selected.clear(); refreshBulk(); }   // les cases sont recréées -> on repart à zéro
+    };
+
+    // --- Sélection multiple / archivage en bloc (admin) ---
+    function refreshBulk() {
+      const bar = $("#pbulk");
+      if (!bar) return;
+      if (selected.size) {
+        bar.classList.remove("hidden");
+        $("#pbulk-count").textContent = `${selected.size} sélectionnée(s)`;
+        $("#pbulk-arch").textContent = `🗄 Archiver (${selected.size})`;
+      } else bar.classList.add("hidden");
+    }
+    if (admin) {
+      $("#plist").addEventListener("change", (e) => {
+        const c = e.target.closest(".psel"); if (!c) return;
+        c.checked ? selected.add(c.dataset.id) : selected.delete(c.dataset.id);
+        refreshBulk();
+      });
+      $("#pbulk-cancel").onclick = () => { selected.clear(); $$(".psel").forEach((c) => (c.checked = false)); refreshBulk(); };
+      $("#pbulk-mark").onclick = async () => {
+        const ids = [...selected];
+        if (!ids.length) return;
+        const st = $("#pbulk-statut").value;
+        const btn = $("#pbulk-mark"); btn.disabled = true;
+        const { error } = await sb.from("prestations").update({ statut: st }).in("id", ids);
+        if (error) { btn.disabled = false; return toast(error.message, "err"); }
+        // Archivage auto des prestations désormais terminées et sans écart :
+        //  - "récupéré"/"clos" = terminal pour tout le monde
+        //  - "livré" = terminal pour les clients FIXES (rien à récupérer, le matériel reste chez eux)
+        const toArchive = ids.filter((id) => {
+          if (ecartIds.has(id)) return false;                 // écart à traiter -> on n'archive pas
+          if (st === "recupere" || st === "clos") return true;
+          if (st === "livre") { const c = cli[(list.find((x) => x.id === id) || {}).client_id]; return c && c.type_client === "fixe"; }
+          return false;
+        });
+        if (toArchive.length) await sb.from("prestations").update({ archivee: true }).in("id", toArchive);
+        btn.disabled = false;
+        toast(`${ids.length} → ${STATUT_LABEL[st]}${toArchive.length ? ` · ${toArchive.length} archivée(s)` : ""} ✔`, "ok");
+        render();
+      };
+      $("#pbulk-arch").onclick = async () => {
+        const ids = [...selected];
+        if (!ids.length) return;
+        const btn = $("#pbulk-arch"); btn.disabled = true;
+        const { error } = await sb.from("prestations").update({ archivee: true }).in("id", ids);
+        btn.disabled = false;
+        if (error) return toast(error.message, "err");
+        toast(`${ids.length} prestation(s) archivée(s) ✔`, "ok");
+        render();
+      };
+    }
+
+    const ptagf = $("#ptagf");
+    if (ptagf) ptagf.addEventListener("click", (e) => {
+      const b = e.target.closest(".ptag");
+      if (!b) return;
+      activeTag = b.dataset.tag;
+      ptagf.querySelectorAll(".ptag").forEach((x) => (x.style.cssText = chipCss(x === b)));
+      draw();
+    });
+    $("#psort").onclick = () => {
+      sortAsc = !sortAsc;
+      $("#psort").textContent = sortAsc ? "📅 Plus proches d'abord ↑" : "📅 Plus lointaines d'abord ↓";
+      draw();
+    };
+    draw();
+    restoreScroll(); // revient à la position quittée (retour depuis une prestation)
+  }
+
+  // =========================================================================
+  //  VUE : Prestations archivées (recherche + tri)
+  // =========================================================================
+  async function viewArchivesPresta() {
+    const all = await db.prestations();
+    const archived = all.filter((p) => p.archivee);
+    const cli = {};
+    (await db.clients()).forEach((c) => (cli[c.id] = c));
+
+    const selected = new Set();
+    const card = (p) => `
+      <div class="card" data-pid="${p.id}">
+        <div style="display:flex;align-items:center;gap:10px">
+          <input type="checkbox" class="asel" data-id="${p.id}" style="width:22px;height:22px;flex:0 0 auto" />
+          <div class="tap grow" onclick="location.hash='#/prestation/${p.id}'" style="display:flex;align-items:center;gap:10px">
+            <div class="grow">
+              <div class="row between"><h3 class="truncate">${esc(p.libelle || p.reference || "Prestation")}</h3>${prestaBadge(p.statut)}</div>
+              <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}</div>
+            </div>
+            <div style="font-size:22px;color:#cbd5c9">›</div>
+          </div>
+        </div>
+        <button class="btn sm ghost" data-unarch="${p.id}" style="margin-top:8px;color:var(--green)">↩︎ Désarchiver</button>
+      </div>`;
+
+    app.innerHTML =
+      topbar("Prestations archivées", { back: "prestations" }) +
+      `<main>
+        <input id="asearch" placeholder="🔍 Rechercher (libellé, client, réf…)" style="margin-bottom:8px" />
+        <div class="row between" style="margin:2px 2px 10px">
+          <div class="sub">${archived.length} archivée(s) · ☑︎ coche pour désarchiver en bloc</div>
+          <button class="btn sm sec" id="asort" style="width:auto">📅 Plus récentes d'abord ↓</button>
+        </div>
+        <div id="alist"></div>
+        <div id="abulk" class="hidden" style="position:sticky;bottom:calc(84px + var(--safe-b));background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;gap:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);margin-top:10px">
+          <button class="btn ghost" id="abulk-cancel" style="flex:0 0 auto">Annuler</button>
+          <button class="btn" id="abulk-un" style="flex:1">↩︎ Désarchiver (0)</button>
+        </div>
+      </main>`;
+
+    let q = "", sortAsc = false;
+    const byDate = (a, b) => {
+      const da = a.date_presta || "", db2 = b.date_presta || "";
+      return (da < db2 ? -1 : da > db2 ? 1 : 0) * (sortAsc ? 1 : -1);
+    };
+    function refreshBulk() {
+      const bar = $("#abulk"), btn = $("#abulk-un");
+      if (!bar) return;
+      if (selected.size) { bar.classList.remove("hidden"); btn.textContent = `↩︎ Désarchiver (${selected.size})`; }
+      else bar.classList.add("hidden");
+    }
+    const draw = () => {
+      let l = archived;
+      if (q) l = l.filter((p) => [p.libelle, p.reference, cli[p.client_id] && cli[p.client_id].nom]
+        .some((v) => _norm(v || "").includes(q)));
+      l = l.slice().sort(byDate);
+      $("#alist").innerHTML = l.length ? l.map(card).join("")
+        : `<div class="empty"><div class="big">🗄</div>Aucune prestation archivée.</div>`;
+      selected.clear(); refreshBulk();
+      $$("[data-unarch]").forEach((b) => b.onclick = async (e) => {
+        e.stopPropagation();
+        b.disabled = true;
+        const { error } = await sb.from("prestations").update({ archivee: false }).eq("id", b.dataset.unarch);
+        if (error) { b.disabled = false; return toast(error.message, "err"); }
+        toast("Prestation désarchivée ✔", "ok"); render();
+      });
+    };
+    $("#alist").addEventListener("change", (e) => {
+      const c = e.target.closest(".asel"); if (!c) return;
+      c.checked ? selected.add(c.dataset.id) : selected.delete(c.dataset.id);
+      refreshBulk();
+    });
+    $("#abulk-cancel").onclick = () => { selected.clear(); $$(".asel").forEach((c) => (c.checked = false)); refreshBulk(); };
+    $("#abulk-un").onclick = async () => {
+      const ids = [...selected];
+      if (!ids.length) return;
+      const btn = $("#abulk-un"); btn.disabled = true;
+      const { error } = await sb.from("prestations").update({ archivee: false }).in("id", ids);
+      btn.disabled = false;
+      if (error) return toast(error.message, "err");
+      toast(`${ids.length} prestation(s) désarchivée(s) ✔`, "ok");
+      render();
+    };
+    $("#asearch").addEventListener("input", (e) => { q = _norm(e.target.value.trim()); draw(); });
+    $("#asort").onclick = () => {
+      sortAsc = !sortAsc;
+      $("#asort").textContent = sortAsc ? "📅 Plus anciennes d'abord ↑" : "📅 Plus récentes d'abord ↓";
+      draw();
+    };
+    draw();
+  }
+
+  // =========================================================================
+  //  VUE : Écarts à traiter (terminées non archivées avec du à-facturer)
+  // =========================================================================
+  async function viewEcarts() {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Écarts à traiter", { back: "prestations" }) + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const [prestas, opens, clientsArr, typesArr] = await Promise.all([
+      db.prestationsTerminees(), db.facturationsOpen(), db.clients(), db.types(),
+    ]);
+    const cli = {}; clientsArr.forEach((c) => (cli[c.id] = c));
+    const tname = {}; typesArr.forEach((t) => (tname[t.id] = t.nom));
+    const openByP = {};
+    opens.forEach((f) => ((openByP[f.prestation_id] ||= []).push(f)));
+    const list = prestas.filter((p) => openByP[p.id] && openByP[p.id].length)
+      .sort((a, b) => (a.date_presta || "") < (b.date_presta || "") ? -1 : (a.date_presta || "") > (b.date_presta || "") ? 1 : 0);
+    const amount = (f) => Number(f.montant != null ? f.montant : (f.quantite * f.prix_unitaire)) || 0;
+
+    const card = (p) => {
+      const fs = openByP[p.id];
+      const total = fs.reduce((s, f) => s + amount(f), 0);
+      const sent = !!p.recap_envoye_at;
+      return `<div class="card">
+        <div class="row between">
+          <div class="grow"><b>${esc(p.libelle || p.reference || "Prestation")}</b>
+            <div class="sub">${esc(cli[p.client_id] ? cli[p.client_id].nom : "Client ?")} · ${dfr(p.date_presta)}</div></div>
+          <span class="badge red">${eur(total)}</span>
+        </div>
+        <div class="sub" style="margin-top:6px">${fs.map((f) => `${f.quantite}× ${esc(tname[f.type_id] || "Matériel")} · ${esc(f.motif)}`).join("<br>")}</div>
+        ${sent ? `<div class="badge" style="margin-top:8px;background:var(--green-soft, #e6f1e3);color:var(--green-d, #1f5c2a)">✉️ Récap envoyé le ${dfr(String(p.recap_envoye_at).slice(0,10))}</div>` : ""}
+        <div class="btn-grid" style="margin-top:10px">
+          <button class="btn sec" onclick="location.hash='#/prestation/${p.id}/manquants'">📊 Détail</button>
+          <button class="btn sec" data-mail="${p.id}">✉️ ${sent ? "Renvoyer le récap" : "Récap mail"}</button>
+          <button class="btn" data-arch="${p.id}">✅ Traité — archiver</button>
+        </div>
+      </div>`;
+    };
+
+    app.innerHTML =
+      topbar("Écarts à traiter", { back: "prestations" }) +
+      `<main>
+        ${list.length
+          ? `<div class="sub" style="margin-bottom:8px">Prestations terminées avec du matériel à facturer (casse, perte, non rendu). Règle chacune (facturation au client), puis archive-la — elle sortira de cette liste.</div>${list.map(card).join("")}`
+          : `<div class="empty"><div class="big">✅</div>Aucun écart en attente. Tout est soldé.</div>`}
+      </main>`;
+
+    $$("[data-arch]").forEach((b) => b.onclick = async () => {
+      b.disabled = true;
+      const { error } = await sb.from("prestations").update({ archivee: true }).eq("id", b.dataset.arch);
+      if (error) { b.disabled = false; return toast(error.message, "err"); }
+      toast("Écart traité — prestation archivée ✔", "ok");
+      render();
+    });
+
+    const pById = {}; list.forEach((p) => (pById[p.id] = p));
+    $$("[data-mail]").forEach((b) => b.onclick = async () => {
+      const p = pById[b.dataset.mail]; if (!p) return;
+      const fs = openByP[p.id] || [];
+      const total = fs.reduce((s, f) => s + amount(f), 0);
+      const lignes = fs.map((f) => ({
+        quantite: f.quantite,
+        materiel: tname[f.type_id] || "Matériel",
+        motif: f.motif || "",
+        montant: amount(f),
+      }));
+      const old = b.textContent;
+      b.disabled = true; b.textContent = "⏳ Envoi…";
+      try {
+        const { data: sess } = await sb.auth.getSession();
+        const token = sess && sess.session ? sess.session.access_token : "";
+        const res = await fetch(CFG.SUPABASE_URL + "/functions/v1/send-ecart", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + token,
+            "apikey": CFG.SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            prestation_lib: p.libelle || p.reference || "Prestation",
+            client_nom: cli[p.client_id] ? cli[p.client_id].nom : "",
+            date_presta: p.date_presta || "",
+            reference: p.reference || "",
+            total,
+            lignes,
+            envoyeur_nom: (state.profile && state.profile.nom) || state.user.email,
+            envoyeur_email: state.user.email,
+          }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok || out.error) throw new Error(out.error || ("HTTP " + res.status));
+        await sb.from("prestations").update({ recap_envoye_at: new Date().toISOString() }).eq("id", p.id);
+        toast("Récap envoyé" + (out.to ? " à " + out.to : "") + " ✔", "ok");
+        render();
+      } catch (e) {
+        b.disabled = false; b.textContent = "✉️ Réessayer";
+        toast("Envoi impossible : " + (e.message || e), "err");
+      }
+    });
+  }
+
+  // =========================================================================
+  //  VUE : Nouvelle prestation
+  // =========================================================================
+  async function viewPrestaForm() {
+    const clients = await db.clients();
+    app.innerHTML =
+      topbar("Nouvelle prestation", { back: "prestations" }) +
+      `<main>
+        <div class="card">
+          <label>Libellé</label>
+          <input id="f-lib" placeholder="Ex : Cocktail 120p – Mairie de Lille" />
+          <label>Client</label>
+          ${clientPickerHtml(clients, "")}
+          <div class="field-row">
+            <div><label>Date de livraison</label><input id="f-date" type="date" value="${new Date().toISOString().slice(0,10)}" /></div>
+            <div><label>Numéro</label><input id="f-ref" placeholder="N° dossier" /></div>
+          </div>
+          <label>Lieu de livraison (étiquettes)</label>
+          <input id="f-lieu" placeholder="Adresse / lieu de livraison" />
+          <select id="f-lieu-pick" style="margin-top:6px"><option value="">— reprendre une adresse enregistrée du client —</option></select>
+          <label>Nombre de convives (pré-remplissage sortie)</label>
+          <input id="f-pax" type="number" min="0" placeholder="ex : 45" />
+          <label>Notes</label>
+          <textarea id="f-notes" placeholder="Infos utiles pour le livreur…"></textarea>
+          <button class="btn block" id="save">Créer la prestation</button>
+        </div>
+      </main>`;
+    clientPickerWire(clients);
+    wireLieuPicker(() => $("#f-client") && $("#f-client").value, "");
+    attachBAN($("#f-lieu"));
+    $("#save").onclick = async () => {
+      const lib = $("#f-lib").value.trim();
+      if (!lib) return toast("Ajoute un libellé", "err");
+      $("#save").disabled = true;
+      const { data, error } = await sb
+        .from("prestations")
+        .insert({
+          libelle: lib,
+          client_id: $("#f-client").value || null,
+          date_presta: $("#f-date").value || null,
+          reference: $("#f-ref").value.trim() || null,
+          lieu_livraison: $("#f-lieu").value.trim() || null,
+          pax: parseInt($("#f-pax").value) || null,
+          notes: $("#f-notes").value.trim() || null,
+          source: "manuel",
+          created_by: state.user.id,
+        })
+        .select()
+        .single();
+      if (error) { $("#save").disabled = false; return toast(error.message, "err"); }
+      go("prestation/" + data.id);
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Modifier une prestation (admin) — client, date, statut, etc.
+  // =========================================================================
+  async function viewPrestaEdit(id) {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Modifier") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const [p, clients] = await Promise.all([db.prestation(id), db.clients()]);
+    app.innerHTML =
+      topbar("Modifier la prestation", { back: "prestation/" + id }) +
+      `<main>
+        <div class="card">
+          <label>Libellé</label>
+          <input id="f-lib" value="${esc(p.libelle || "")}" placeholder="Libellé" />
+          <label>Client</label>
+          ${clientPickerHtml(clients, p.client_id)}
+          <div class="field-row">
+            <div><label>Date de livraison</label><input id="f-date" type="date" value="${p.date_presta ? String(p.date_presta).slice(0,10) : ""}" /></div>
+            <div><label>Numéro</label><input id="f-ref" value="${esc(p.reference || "")}" placeholder="N° dossier" /></div>
+          </div>
+          <label>Lieu de livraison (étiquettes)</label>
+          <input id="f-lieu" value="${esc(p.lieu_livraison || "")}" placeholder="Adresse / lieu de livraison" />
+          <select id="f-lieu-pick" style="margin-top:6px"><option value="">— reprendre une adresse enregistrée du client —</option></select>
+          <label>Statut</label>
+          <select id="f-statut">
+            ${Object.keys(STATUT_LABEL).map((s) => `<option value="${s}" ${p.statut === s ? "selected" : ""}>${esc(STATUT_LABEL[s])}</option>`).join("")}
+          </select>
+          <label>Notes</label>
+          <textarea id="f-notes" placeholder="Infos utiles…">${esc(p.notes || "")}</textarea>
+          <label>Nombre de convives (pré-remplissage sortie)</label>
+          <input id="f-pax" type="number" min="0" value="${p.pax != null ? p.pax : ""}" placeholder="ex : 45" />
+          <label>Lien preuve Consignerie (QR du BL)</label>
+          <input id="f-consurl" value="${esc(p.consignerie_url || "")}" placeholder="https://app.consignerie.com/bl/…" />
+          <button class="btn block" id="save">Enregistrer les modifications</button>
+        </div>
+        <div class="card"><div class="sub">Modifier le client ou la date ne change pas les mouvements de matériel déjà enregistrés. Pour corriger les quantités sorties/récupérées, utilise « Revoir la sortie » / « Récupération » sur la fiche.</div></div>
+      </main>`;
+    clientPickerWire(clients);
+    wireLieuPicker(() => $("#f-client") && $("#f-client").value, p.client_id);
+    attachBAN($("#f-lieu"));
+    $("#save").onclick = async () => {
+      const lib = $("#f-lib").value.trim();
+      if (!lib) return toast("Ajoute un libellé", "err");
+      $("#save").disabled = true;
+      const { error } = await sb.from("prestations").update({
+        libelle: lib,
+        client_id: $("#f-client").value || null,
+        date_presta: $("#f-date").value || null,
+        reference: $("#f-ref").value.trim() || null,
+        statut: $("#f-statut").value,
+        notes: $("#f-notes").value.trim() || null,
+        pax: parseInt($("#f-pax").value) || null,
+        consignerie_url: $("#f-consurl").value.trim() || null,
+        lieu_livraison: $("#f-lieu").value.trim() || null,
+      }).eq("id", id);
+      $("#save").disabled = false;
+      toast(error ? error.message : "Prestation modifiée ✔", error ? "err" : "ok");
+      if (!error) go("prestation/" + id);
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Détail prestation
+  // =========================================================================
+  async function viewPrestationDetail(id) {
+    const p = await db.prestation(id);
+    const bilan = await db.bilan(id);
+    const totalSortie = bilan.reduce((s, b) => s + b.q_sortie, 0);
+    const totalRetour = bilan.reduce((s, b) => s + b.q_retour, 0);
+    const totalManq = bilan.reduce((s, b) => s + b.q_manquant, 0);
+
+    app.innerHTML =
+      topbar(p.libelle || "Prestation", { back: "prestations" }) +
+      `<main>
+        <div class="card">
+          <div class="row between">
+            <div class="grow">
+              <h3 style="cursor:pointer" ${p.client_id ? `onclick="location.hash='#/client/${p.client_id}'"` : ""}>${esc(p.clients ? p.clients.nom : "Client ?")}</h3>
+              <div class="sub">${p.clients ? (p.clients.type_client === "fixe" ? "Client fixe · " : "Client ponctuel · ") : ""}${dfr(p.date_presta)}${p.reference ? " · Réf " + esc(p.reference) : ""}${p.pax ? " · " + p.pax + " pers." : ""}</div>
+              <div style="margin-top:6px">${srcBadge(p.source, true)}</div>
+            </div>
+            ${prestaBadge(p.statut)}
+          </div>
+          ${p.notes ? `<div class="divider"></div><div class="sub">${esc(p.notes)}</div>` : ""}
+          ${p.recap_envoye_at ? `<div class="badge" style="margin-top:10px;background:var(--green-soft, #e6f1e3);color:var(--green-d, #1f5c2a)">✉️ Récap écart envoyé le ${dfr(String(p.recap_envoye_at).slice(0,10))}</div>` : ""}
+        </div>
+
+        <div class="stat">
+          <div class="box"><div class="n">${totalSortie}</div><div class="l">Sortis</div></div>
+          <div class="box"><div class="n green">${totalRetour}</div><div class="l">Revenus</div></div>
+        </div>
+
+        <button class="btn sec block" style="margin-bottom:6px" onclick="location.hash='#/prestation/${id}/labels'">🏷️ Étiquettes de préparation</button>
+
+        <div class="section-title">Étape en cours</div>
+        <div id="workflow"></div>
+      </main>`;
+
+    // ---- Workflow guidé selon le statut et le type de client ----
+    const fixe = p.clients && p.clients.type_client === "fixe";
+    const wf = $("#workflow");
+    const bigBtn = (label, sub, cls, onclick) =>
+      `<button class="btn ${cls} block" style="padding:18px" onclick="${onclick}">${label}<br><small style="font-weight:500">${sub}</small></button>`;
+
+    const setStatut = async (st, okMsg) => {
+      const { error } = await sb.from("prestations").update({ statut: st }).eq("id", id);
+      if (error) return toast(error.message, "err");
+      toast(okMsg, "ok"); render();
+    };
+
+    if (p.statut === "en_cours") {
+      wf.innerHTML = bigBtn("📦 Préparer la sortie (quai)", "Charge et pointe le matériel au départ", "",
+        `location.hash='#/prestation/${id}/sortie'`);
+    } else if (p.statut === "a_quai") {
+      wf.innerHTML =
+        `<div class="card" style="text-align:center"><div style="font-size:30px">🚏</div><b>${totalSortie} pièce(s) à quai, prêtes à partir.</b>
+          <div class="sub" style="margin-top:4px">Le matériel est chargé. Valide le départ quand le camion part.</div></div>` +
+        `<button class="btn block" id="wf-depart" style="padding:18px">🚚 Valider le départ<br><small style="font-weight:500">La prestation passe « en cours de livraison »</small></button>`;
+      $("#wf-depart").onclick = () => setStatut("en_livraison", "Départ validé ✔");
+    } else if (p.statut === "en_livraison") {
+      wf.innerHTML =
+        `<div class="card"><div class="sub">🚚 En route vers le client (${totalSortie} pièce(s)).</div></div>` +
+        `<button class="btn block" id="wf-livre" style="padding:18px">✅ Confirmer la livraison<br><small style="font-weight:500">Le matériel est déposé chez le client</small></button>`;
+      $("#wf-livre").onclick = () => setStatut("a_recuperer", "Livraison confirmée ✔");
+    } else if (p.statut === "a_recuperer") {
+      wf.innerHTML = fixe
+        ? bigBtn("📥 Récupérer (livraison client fixe)", "Pointe ce qui est repris ; le reste continue chez le client", "",
+            `location.hash='#/prestation/${id}/retour'`)
+        : bigBtn("📥 Récupérer le matériel", "Pointe le matériel repris chez le client", "",
+            `location.hash='#/prestation/${id}/recuperation'`);
+    } else if (p.statut === "recupere" || p.statut === "livre") {
+      wf.innerHTML =
+        `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div><b>Prestation ${STATUT_LABEL[p.statut].toLowerCase()}.</b>
+          ${totalManq ? `<div class="sub" style="margin-top:6px">${totalManq} pièce(s) non restituée(s) — voir la fiche client pour la facturation.</div>` : `<div class="sub" style="margin-top:6px">Tout est réglé.</div>`}</div>` +
+        bigBtn("✏️ Corriger la récupération", "Modifier le pointage si un livreur s'est trompé", "sec",
+          fixe ? `location.hash='#/prestation/${id}/retour'` : `location.hash='#/prestation/${id}/recuperation'`);
+    }
+
+    // Accès discret pour corriger une étape si besoin (insertAdjacentHTML pour ne pas
+    // détruire les gestionnaires d'événements déjà attachés ci-dessus)
+    wf.insertAdjacentHTML("beforeend", `<div class="sub" style="text-align:center;margin-top:14px">
+      <a href="#/prestation/${id}/sortie" style="color:var(--muted)">Revoir la sortie</a>
+      ${!fixe ? ` · <a href="#/prestation/${id}/recuperation" style="color:var(--muted)">Récupération</a>` : ` · <a href="#/prestation/${id}/retour" style="color:var(--muted)">Récupération</a>`}
+    </div>`);
+
+    // Preuve de livraison Consignerie (prestations issues de briffetools / La consignerie)
+    if (p.source === "briffetools" || isConsigUrl(p.consignerie_url)) {
+      const kwrap = document.createElement("div");
+      kwrap.style.cssText = "margin-top:20px";
+      kwrap.innerHTML = consignerieCardHtml(p);
+      app.querySelector("main").appendChild(kwrap);
+      wireConsignerieCard(p);
+    }
+
+    // Commentaire livreur -> logistique (livraison + récupération)
+    if (["en_livraison", "a_recuperer", "recupere", "livre"].includes(p.statut)) {
+      const cwrap = document.createElement("div");
+      cwrap.style.cssText = "margin-top:20px";
+      cwrap.innerHTML = `<div class="section-title">Un mot pour la logistique</div>` + commentCardHtml("livraison");
+      app.querySelector("main").appendChild(cwrap);
+      wireCommentCard(p, p.statut === "recupere" ? "récupération" : "livraison");
+    }
+
+    // Archivage — quand la prestation est terminée (récupérée / livrée / close), ou pour désarchiver
+    const terminal = ["recupere", "livre", "clos"].includes(p.statut);
+    if (terminal || p.archivee) {
+      const arch = document.createElement("button");
+      arch.className = "btn sec block";
+      arch.style.cssText = "margin-top:24px";
+      arch.textContent = p.archivee ? "↩︎ Désarchiver la prestation" : "🗄 Archiver la prestation";
+      arch.onclick = async () => {
+        arch.disabled = true;
+        const { error } = await sb.from("prestations").update({ archivee: !p.archivee }).eq("id", id);
+        if (error) { arch.disabled = false; return toast(error.message, "err"); }
+        toast(p.archivee ? "Prestation désarchivée ✔" : "Prestation archivée ✔", "ok");
+        go(p.archivee ? "prestation/" + id : "prestations");
+      };
+      app.querySelector("main").appendChild(arch);
+    }
+
+    // Modification de la prestation — réservé aux admins
+    if (isAdmin()) {
+      const edit = document.createElement("button");
+      edit.className = "btn sec block";
+      edit.style.cssText = "margin-top:24px";
+      edit.textContent = "✏️ Modifier la prestation (admin)";
+      edit.onclick = () => go("prestation/" + id + "/edit");
+      app.querySelector("main").appendChild(edit);
+    }
+
+    // Suppression de la prestation — réservé aux admins
+    if (isAdmin()) {
+      const del = document.createElement("button");
+      del.className = "btn ghost block";
+      del.style.cssText = "color:var(--danger);margin-top:24px";
+      del.textContent = "🗑 Supprimer la prestation";
+      app.querySelector("main").appendChild(del);
+      let armed = false;
+      del.onclick = async () => {
+        if (!armed) {
+          armed = true;
+          del.textContent = "Confirmer ? (supprime aussi ses mouvements et facturations)";
+          del.classList.remove("ghost"); del.classList.add("danger");
+          setTimeout(() => { if (!armed) return; armed = false; del.textContent = "🗑 Supprimer la prestation"; del.classList.add("ghost"); del.classList.remove("danger"); }, 4500);
+          return;
+        }
+        del.disabled = true;
+        const { error } = await sb.from("prestations").delete().eq("id", id);
+        if (error) { del.disabled = false; return toast(error.message, "err"); }
+        toast("Prestation supprimée ✔", "ok");
+        go("prestations");
+      };
+    }
+  }
+
+  // =========================================================================
+  //  VUE : Flux Sortie / Retour  (scan unités + quantités)
+  // =========================================================================
+  async function viewFlux(id, sens) {
+    const p = await db.prestation(id);
+    const types = await db.types();
+    const label = sens === "sortie" ? "Sortie" : "Retour";
+    const verb = sens === "sortie" ? "livrés" : "récupérés";
+
+    // Tags / packs (pour le filtre de sortie) + présélection auto selon le type Sextan
+    const allTags = sens === "sortie" ? await db.tags() : [];
+    const baseTags = allTags.filter((t) => t.is_base).map((t) => t.nom);
+    let preselTags = []; // packs présélectionnés (peut être plusieurs)
+    if (sens === "sortie" && p.type_presta) {
+      const map = await db.typeTagMap();
+      const hit = map.find((m) => m.sextan_type === p.type_presta);
+      if (hit) preselTags = (hit.tags || []).filter((t) => allTags.some((x) => x.nom === t));
+    }
+
+    // Précharge les quantités déjà enregistrées pour ce sens (permet de revoir / corriger / annuler).
+    const [mvtRes, factRes] = await Promise.all([
+      sb.from("mouvements").select("type_id,quantite").eq("prestation_id", id).eq("sens", sens),
+      sens === "retour"
+        ? sb.from("facturations").select("type_id,motif,quantite").eq("prestation_id", id).eq("statut", "a_facturer").in("motif", ["casse", "perte"])
+        : Promise.resolve({ data: [] }),
+    ]);
+    const cpByType = {}; // casses/pertes déjà déclarées (retour)
+    (factRes.data || []).forEach((f) => (cpByType[f.type_id] = (cpByType[f.type_id] || 0) + f.quantite));
+    const existingCP = (factRes.data || []).slice();
+
+    // Modèle « un QR par type » : chaque scan incrémente la quantité du type.
+    const counts = {};
+    types.forEach((t) => (counts[t.id] = 0));
+    (mvtRes.data || []).forEach((m) => (counts[m.type_id] = (counts[m.type_id] || 0) + m.quantite));
+    // en retour, les casses/pertes ont été comptées comme "revenues" : on les retire de la saisie normale
+    if (sens === "retour") Object.keys(cpByType).forEach((tid) => (counts[tid] = Math.max(0, (counts[tid] || 0) - cpByType[tid])));
+
+    // Pré-remplissage de la sortie, si aucune sortie n'a encore été saisie.
+    //  1) priorité à la « préparation » calculée par briffetools (liste {code, qte})
+    //  2) sinon, dotation globale par matériel (fixe / 1 pour X pers.), limitée au pack.
+    let prefilled = false, prefillSrc = "";
+    if (sens === "sortie" && (mvtRes.data || []).length === 0) {
+      const codeMap = {};
+      types.forEach((t) => { if (t.code_qr) codeMap[t.code_qr.trim()] = t; });
+      const prep = Array.isArray(p.preparation) ? p.preparation : [];
+      prep.forEach((it) => {
+        const t = codeMap[String(it && it.code || "").trim()];
+        const q = parseInt(it && it.qte) || 0;
+        if (t && q > 0) { counts[t.id] = (counts[t.id] || 0) + q; prefilled = true; }
+      });
+      if (prefilled) prefillSrc = "briffetools";
+      else if (p.pax > 0) {
+        const inPack = (t) => {
+          if (!preselTags.length) return true; // aucun pack mappé -> tout le matériel doté
+          const tgs = t.tags || [];
+          return tgs.some((x) => preselTags.includes(x)) || tgs.some((x) => baseTags.includes(x));
+        };
+        types.forEach((t) => {
+          const fixe = t.dotation_fixe || 0, perPax = t.dotation_pax || 0;
+          if ((fixe > 0 || perPax > 0) && inPack(t)) {
+            const q = fixe + (perPax > 0 ? Math.ceil(p.pax / perPax) : 0);
+            if (q > 0) { counts[t.id] = q; prefilled = true; }
+          }
+        });
+        if (prefilled) prefillSrc = "dotation";
+      }
+    }
+    const byCode = {};
+    types.forEach((t) => { if (t.code_qr) byCode[t.code_qr.trim()] = t; });
+
+    // Regroupement par catégorie pour l'affichage
+    const byCat = {};
+    types.forEach((t) => ((byCat[t.categorie || "Autres"] ||= []).push(t)));
+
+    const typeById = {};
+    types.forEach((t) => (typeById[t.id] = t));
+    const typeOptions = '<option value="">— matériel —</option>' +
+      types.map((t) => `<option value="${t.id}">${esc(t.nom)}</option>`).join("");
+
+    const lineHtml = (t) => `
+      <div class="mat-line" data-line="${t.id}" data-tags="${esc((t.tags || []).join("|"))}">
+        ${t.photo_url
+          ? `<img src="${esc(t.photo_url)}" alt="" style="width:38px;height:38px;border-radius:8px;object-fit:cover;flex:0 0 auto;background:#eef0ee;margin-right:8px" />`
+          : `<div style="width:38px;height:38px;border-radius:8px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:17px;margin-right:8px">📦</div>`}
+        <div class="name"><b>${esc(t.nom)}</b><small>${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR — saisie manuelle"}</small></div>
+        <div class="qty" data-type="${t.id}">
+          <button data-d="-1">−</button>
+          <input type="number" inputmode="numeric" value="${counts[t.id] || 0}" min="0" data-qtyinput="${t.id}" />
+          <button data-d="1">＋</button>
+        </div>
+      </div>`;
+
+    app.innerHTML =
+      topbar(label + " · " + (p.libelle || ""), { back: "prestation/" + id }) +
+      `<main>
+        <div class="card">
+          <div id="scanner-box"></div>
+          <div class="scan-hint" id="scan-hint">Scanne le QR d'une caisse… chaque scan = +1</div>
+          <div class="field-row" style="margin-top:6px">
+            <input id="manual-code" placeholder="ou saisir un code (GL-…)" />
+            <button class="btn sm sec" id="manual-add" style="flex:0 0 auto">+1</button>
+          </div>
+        </div>
+
+        ${sens === "sortie" && allTags.length ? `
+        <div class="section-title">Packs à préparer${preselTags.length ? ` — présélection : ${esc(preselTags.join(", "))}` : ""}</div>
+        <div id="tag-filter" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+          <button type="button" class="tagf" data-tag="__all__" style="${chipCss(preselTags.length === 0)}">Tout</button>
+          ${allTags.map((tg) => { const on = preselTags.includes(tg.nom); return `<button type="button" class="tagf" data-tag="${esc(tg.nom)}" data-on="${on ? "1" : "0"}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
+        </div>` : ""}
+
+        ${prefilled ? `<div class="card" style="background:#eef7ee;border-color:var(--green)"><div class="sub" style="color:var(--green-d)">✨ Quantités <b>pré-remplies</b> ${prefillSrc === "briffetools" ? "d'après la préparation briffetools" : `d'après la dotation pour <b>${p.pax} pers.</b>`} — vérifie et ajuste avant de valider.</div></div>` : ""}
+        <div class="section-title">Matériel ${verb}</div>
+        <div class="list" id="qty-card">
+          ${Object.keys(byCat).sort().map((cat) => `
+            <div class="card matgroup">
+              <div class="sub" style="font-weight:700;margin-bottom:4px">${esc(cat)}</div>
+              ${byCat[cat].map(lineHtml).join("")}
+            </div>`).join("")}
+        </div>
+
+        ${sens === "retour" ? `
+        <div class="section-title">⚠️ Casses & pertes constatées</div>
+        <div class="card">
+          <div class="sub" style="margin-bottom:6px">Vérifie l'intégrité du matériel. Déclare ici ce qui revient cassé ou ce qui manque — ce sera directement ajouté à facturer.</div>
+          <div id="cp-list"></div>
+          <button class="btn sec block" id="cp-add">＋ Déclarer une casse / perte</button>
+        </div>` : ""}
+
+        ${sens === "retour" ? `<div class="section-title">Un mot pour la logistique</div>${commentCardHtml("récupération")}` : ""}
+
+        <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
+          <div class="row between" style="margin-bottom:8px">
+            <b id="recap">0 pièce(s) ${verb}</b>
+          </div>
+          <button class="btn ${sens==="sortie"?"":"sec"} block" id="valider">Valider ${label.toLowerCase()}</button>
+        </div>
+      </main>`;
+    if (sens === "retour") wireCommentCard(p, "récupération");
+
+    // --- déclaration des casses/pertes (retour uniquement) ---
+    const cpAdd = $("#cp-add");
+    if (cpAdd) {
+      const addRow = (preset) => {
+        const row = document.createElement("div");
+        row.className = "cp-row";
+        row.style.cssText = "border-top:1px solid var(--line);padding:10px 0";
+        row.innerHTML = `
+          <select class="cp-type" style="margin-bottom:6px">${typeOptions}</select>
+          <div class="row" style="gap:8px">
+            <select class="cp-motif" style="flex:1">
+              <option value="casse">🔨 Cassé</option>
+              <option value="perte">❓ Perdu / manquant</option>
+            </select>
+            <input type="number" class="cp-qty" inputmode="numeric" value="1" min="1" style="width:72px;text-align:center" />
+            <button class="btn sm ghost cp-rm" style="flex:0 0 auto;color:var(--danger)">✕</button>
+          </div>`;
+        $("#cp-list").appendChild(row);
+        if (preset) {
+          row.querySelector(".cp-type").value = preset.type_id;
+          row.querySelector(".cp-motif").value = preset.motif;
+          row.querySelector(".cp-qty").value = preset.quantite;
+        }
+        row.querySelector(".cp-rm").onclick = () => row.remove();
+      };
+      cpAdd.onclick = () => addRow();
+      // repré-remplit les casses/pertes déjà déclarées (revoir un retour)
+      existingCP.forEach((f) => addRow({ type_id: f.type_id, motif: f.motif, quantite: f.quantite }));
+    }
+
+    const updateRecap = () => {
+      const n = Object.values(counts).reduce((a, b) => a + b, 0);
+      $("#recap").textContent = `${n} pièce(s) ${verb}`;
+    };
+    const setCount = (tid, v) => {
+      counts[tid] = Math.max(0, v);
+      const input = $(`[data-qtyinput="${tid}"]`);
+      if (input) input.value = counts[tid];
+      updateRecap();
+    };
+    const flashLine = (tid) => {
+      const line = $(`[data-line="${tid}"]`);
+      if (!line) return;
+      line.style.transition = "background .1s";
+      line.style.background = "#dcfce7";
+      setTimeout(() => (line.style.background = ""), 350);
+    };
+
+    // steppers + saisie directe
+    $("#qty-card").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-d]");
+      if (!b) return;
+      const tid = b.closest(".qty").dataset.type;
+      setCount(tid, (counts[tid] || 0) + parseInt(b.dataset.d));
+    });
+    $("#qty-card").addEventListener("input", (e) => {
+      const inp = e.target.closest("[data-qtyinput]");
+      if (!inp) return;
+      counts[inp.dataset.qtyinput] = Math.max(0, parseInt(inp.value) || 0);
+      updateRecap();
+    });
+
+    // scan / saisie d'un code -> +1 sur le type correspondant
+    function addCode(code) {
+      code = (code || "").trim();
+      if (!code) return;
+      const t = byCode[code];
+      const hint = $("#scan-hint");
+      if (!t) {
+        beep(160);
+        if (hint) hint.textContent = "❌ Code inconnu : " + code;
+        return;
+      }
+      setCount(t.id, (counts[t.id] || 0) + 1);
+      flashLine(t.id);
+      beep(660);
+      if (hint) hint.textContent = `✅ ${t.nom} : ${counts[t.id]}`;
+      // amène la ligne à l'écran
+      const line = $(`[data-line="${t.id}"]`);
+      if (line) line.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    $("#manual-add").onclick = () => { addCode($("#manual-code").value); $("#manual-code").value = ""; };
+    $("#manual-code").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#manual-add").click(); });
+
+    // Filtre par packs (sortie), multi-sélection : affiche l'union des packs choisis + le matériel de base.
+    const activeTags = new Set(preselTags);
+    const tf = $("#tag-filter");
+    const restyle = () => {
+      const allBtn = tf.querySelector('.tagf[data-tag="__all__"]');
+      if (allBtn) allBtn.style.cssText = chipCss(activeTags.size === 0);
+      tf.querySelectorAll('.tagf:not([data-tag="__all__"])').forEach((x) => (x.style.cssText = chipCss(activeTags.has(x.dataset.tag))));
+    };
+    const applyTagFilter = () => {
+      const showAll = activeTags.size === 0;
+      $$("#qty-card .mat-line").forEach((line) => {
+        const tgs = (line.dataset.tags || "").split("|").filter(Boolean);
+        const show = showAll || tgs.some((x) => activeTags.has(x)) || tgs.some((x) => baseTags.includes(x));
+        line.style.display = show ? "" : "none";
+      });
+      $$("#qty-card .matgroup").forEach((g) => {
+        const anyVisible = Array.from(g.querySelectorAll(".mat-line")).some((l) => l.style.display !== "none");
+        g.style.display = anyVisible ? "" : "none";
+      });
+    };
+    if (tf) {
+      tf.querySelectorAll(".tagf").forEach((b) => b.onclick = () => {
+        if (b.dataset.tag === "__all__") activeTags.clear();
+        else { activeTags.has(b.dataset.tag) ? activeTags.delete(b.dataset.tag) : activeTags.add(b.dataset.tag); }
+        restyle(); applyTagFilter();
+      });
+      applyTagFilter();
+      // sécurité : si la présélection n'affiche rien (matériel pas encore taggé), on retombe sur « Tout »
+      if (activeTags.size && !$$("#qty-card .mat-line").some((l) => l.style.display !== "none")) {
+        activeTags.clear(); restyle(); applyTagFilter();
+      }
+    }
+
+    updateRecap(); // reflète les quantités déjà saisies au chargement
+    startScanner(addCode);
+
+    $("#valider").onclick = async () => {
+      const rows = [];
+      let totalSaisi = 0;
+      types.forEach((t) => {
+        if (counts[t.id] > 0) {
+          totalSaisi += counts[t.id];
+          rows.push({ prestation_id: id, sens, type_id: t.id, unit_id: null, quantite: counts[t.id], par_user: state.user.id });
+        }
+      });
+
+      // casses & pertes déclarées (retour) -> facturations + règlement du solde
+      const facts = [];
+      $$(".cp-row").forEach((row) => {
+        const tid = row.querySelector(".cp-type").value;
+        const motif = row.querySelector(".cp-motif").value;
+        const qte = Math.max(0, parseInt(row.querySelector(".cp-qty").value) || 0);
+        if (!tid || qte <= 0) return;
+        const t = typeById[tid];
+        facts.push({
+          prestation_id: id, client_id: p.client_id || null, type_id: tid,
+          motif, quantite: qte, prix_unitaire: t ? t.prix_unitaire : 0, statut: "a_facturer",
+        });
+        // un cassé/perdu est "sorti du parc" chez le client : on le compte en retour
+        // pour qu'il n'apparaisse plus comme manquant (il est désormais facturé)
+        rows.push({ prestation_id: id, sens: "retour", type_id: tid, unit_id: null, quantite: qte, par_user: state.user.id });
+      });
+
+      $("#valider").disabled = true;
+
+      // REMPLACEMENT idempotent : on efface d'abord ce sens (permet de corriger / annuler),
+      // puis on réécrit à partir de la saisie courante.
+      const delMvt = await sb.from("mouvements").delete().eq("prestation_id", id).eq("sens", sens);
+      if (delMvt.error) { $("#valider").disabled = false; return toast(delMvt.error.message, "err"); }
+      if (sens === "retour") {
+        const delF = await sb.from("facturations").delete().eq("prestation_id", id).eq("statut", "a_facturer").in("motif", ["casse", "perte"]);
+        if (delF.error) { $("#valider").disabled = false; return toast(delF.error.message, "err"); }
+      }
+      if (rows.length) {
+        const { error } = await sb.from("mouvements").insert(rows);
+        if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
+      }
+      if (facts.length) {
+        const { error } = await sb.from("facturations").insert(facts);
+        if (error) { $("#valider").disabled = false; return toast("Retour ok mais facturation : " + error.message, "err"); }
+      }
+
+      // avancement du statut selon la saisie
+      let nextStatut;
+      if (sens === "sortie") {
+        // on ne fait avancer/reculer le statut QUE pendant la phase de préparation ;
+        // si la prestation est déjà partie/livrée, on corrige les quantités sans régresser le statut.
+        if (p.statut === "en_cours" || p.statut === "a_quai") {
+          nextStatut = totalSaisi > 0 ? "a_quai" : "en_cours"; // 0 = sortie annulée -> retour en préparation
+        } else {
+          nextStatut = p.statut;
+        }
+      } else {
+        nextStatut = (totalSaisi > 0 || facts.length) ? "recupere" : "a_recuperer";
+      }
+      const stErr = (await sb.from("prestations").update({ statut: nextStatut }).eq("id", id)).error;
+      if (stErr) { $("#valider").disabled = false; return toast("Statut : " + stErr.message, "err"); }
+      // Auto-archivage du retour soldé sans rien à facturer ; sinon on la ré-affiche dans « Écarts »
+      let archivedRetour = false;
+      if (sens === "retour" && nextStatut === "recupere") {
+        archivedRetour = await maybeAutoArchive(id);
+        if (!archivedRetour) await sb.from("prestations").update({ archivee: false }).eq("id", id);
+      }
+      stopScanner();
+      const msg = sens === "sortie"
+        ? (totalSaisi > 0 ? `Sortie enregistrée (${totalSaisi} pièce(s)) ✔` : "Sortie annulée ✔")
+        : (facts.length ? `Retour + ${facts.length} à facturer → « Écarts à traiter » ✔` : (archivedRetour ? "Retour soldé — prestation archivée ✔" : "Retour enregistré ✔"));
+      toast(msg, "ok");
+      go("prestation/" + id);
+    };
+  }
+
+  // ---- Scanner caméra (html5-qrcode) -------------------------------------
+  let qrScanner = null;
+  async function startScanner(onCode) {
+    try {
+      qrScanner = new Html5Qrcode("scanner-box", { verbose: false });
+      let last = 0;
+      await qrScanner.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 220, height: 220 } },
+        (decoded) => {
+          const now = Date.now();
+          if (now - last < 900) return; // anti-rafale
+          last = now;
+          onCode(decoded);
+        },
+        () => {}
+      );
+      const hint = document.getElementById("scan-hint");
+      if (hint) hint.textContent = "Caméra active — vise un QR code";
+    } catch (e) {
+      const box = document.getElementById("scanner-box");
+      if (box) box.innerHTML =
+        `<div style="padding:24px;color:#fff;text-align:center;font-size:14px">📷 Caméra indisponible.<br>Utilise la saisie manuelle du code ci-dessous.</div>`;
+    }
+  }
+  async function stopScanner() {
+    if (qrScanner) {
+      try { await qrScanner.stop(); qrScanner.clear(); } catch (e) {}
+      qrScanner = null;
+    }
+  }
+  window.addEventListener("hashchange", stopScanner);
+
+  function beep(freq) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.frequency.value = freq; o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(0.15, ctx.currentTime);
+      o.start(); o.stop(ctx.currentTime + 0.08);
+    } catch (e) {}
+  }
+
+  // =========================================================================
+  //  VUE : Récupération (client ponctuel) — pointage de ce qui revient
+  // =========================================================================
+  async function viewRecuperation(id) {
+    const p = await db.prestation(id);
+    const bilan = await db.bilan(id);
+    // On se base sur ce qui est SORTI (pas sur le reste à récupérer) : l'écran reste
+    // donc modifiable même après validation, pour corriger une erreur de pointage.
+    const lignes = bilan.filter((b) => b.q_sortie > 0);
+    // Pertes déjà déclarées (pour pré-remplir « non récupéré » en mode correction)
+    const factRes = await sb.from("facturations").select("type_id,quantite")
+      .eq("prestation_id", id).eq("statut", "a_facturer").eq("motif", "perte");
+    const perteByType = {};
+    (factRes.data || []).forEach((f) => (perteByType[f.type_id] = (perteByType[f.type_id] || 0) + f.quantite));
+    const dejaValide = p.statut === "recupere" || p.statut === "livre";
+    // Vignettes photo du matériel
+    const typePhoto = {};
+    (await db.types()).forEach((t) => (typePhoto[t.id] = t.photo_url));
+    const thumb = (tid) => typePhoto[tid]
+      ? `<img src="${esc(typePhoto[tid])}" alt="" style="width:40px;height:40px;border-radius:8px;object-fit:cover;flex:0 0 auto;background:#eef0ee" />`
+      : `<div style="width:40px;height:40px;border-radius:8px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:18px">📦</div>`;
+
+    const line = (b) => {
+      const exp = b.q_sortie;
+      const nonrec = Math.min(exp, perteByType[b.type_id] || 0);
+      const rec = exp - nonrec;
+      return `
+      <div class="card" data-rec="${b.type_id}" data-exp="${exp}" data-prix="${b.prix_unitaire}" data-nom="${esc(b.type_nom)}">
+        <div class="row between" style="align-items:center;gap:10px"><div class="row" style="align-items:center;gap:10px">${thumb(b.type_id)}<b>${esc(b.type_nom)}</b></div><span class="badge gray">Sortis ${exp}</span></div>
+        <div class="field-row" style="margin-top:8px">
+          <div><label style="margin-top:0">Récupéré</label><input class="rec-in" type="number" inputmode="numeric" value="${rec}" min="0" max="${exp}" /></div>
+          <div><label style="margin-top:0">Non récupéré</label><input class="nonrec-in" type="number" inputmode="numeric" value="${nonrec}" min="0" max="${exp}" /></div>
+        </div>
+        <div class="sub perte-lbl" style="margin-top:6px"></div>
+      </div>`;
+    };
+
+    app.innerHTML =
+      topbar((dejaValide ? "Corriger récup · " : "Récupération · ") + (p.libelle || ""), { back: "prestation/" + id }) +
+      `<main>
+        ${lignes.length === 0
+          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Rien n'a été sorti sur cette prestation.</div>`
+          : `<div class="sub" style="margin-bottom:8px">${dejaValide ? "<b>Correction :</b> ajuste les quantités si un livreur s'est trompé, puis revalide. " : ""}Pointe chaque ligne : par défaut tout est récupéré. Indique le nombre « Non récupéré » le cas échéant — il sera facturé au client.</div>
+             <button class="btn sec block" id="tout" style="margin-bottom:10px">✅ Tout récupéré, rien à signaler</button>
+             ${lignes.map(line).join("")}`}
+
+        <div class="section-title">Un mot pour la logistique</div>
+        ${commentCardHtml("récupération")}
+
+        <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
+          <div class="row between" style="margin-bottom:8px"><b id="recap-rec">À facturer : 0,00 €</b></div>
+          <button class="btn block" id="valider">Valider la récupération</button>
+        </div>
+      </main>`;
+    wireCommentCard(p, "récupération");
+
+    const cards = () => $$("[data-rec]");
+    const readCard = (el) => {
+      const exp = parseInt(el.dataset.exp);
+      const nonrec = Math.max(0, Math.min(exp, parseInt(el.querySelector(".nonrec-in").value) || 0));
+      const rec = exp - nonrec;
+      return { tid: el.dataset.rec, nom: el.dataset.nom, prix: Number(el.dataset.prix), exp, rec, nonrec };
+    };
+    const refresh = () => {
+      let total = 0;
+      cards().forEach((el) => {
+        const d = readCard(el);
+        total += d.nonrec * d.prix;
+        const lbl = el.querySelector(".perte-lbl");
+        if (d.nonrec === 0) { lbl.innerHTML = "✔ complet"; lbl.style.color = "var(--ok)"; }
+        else { lbl.innerHTML = `${d.nonrec} non récupéré(s) → ${eur(d.nonrec * d.prix)}`; lbl.style.color = "var(--danger)"; }
+      });
+      const r = $("#recap-rec"); if (r) r.textContent = "À facturer : " + eur(total) + " HT";
+    };
+    // Récupéré et Non récupéré sont complémentaires : éditer l'un ajuste l'autre
+    app.querySelector("main").addEventListener("input", (e) => {
+      const el = e.target.closest("[data-rec]");
+      if (!el) return;
+      const exp = parseInt(el.dataset.exp);
+      const recIn = el.querySelector(".rec-in"), nonIn = el.querySelector(".nonrec-in");
+      if (e.target === recIn) {
+        const rec = Math.max(0, Math.min(exp, parseInt(recIn.value) || 0));
+        recIn.value = rec; nonIn.value = exp - rec;
+      } else if (e.target === nonIn) {
+        const non = Math.max(0, Math.min(exp, parseInt(nonIn.value) || 0));
+        nonIn.value = non; recIn.value = exp - non;
+      }
+      refresh();
+    });
+    const tout = $("#tout");
+    if (tout) tout.onclick = () => {
+      cards().forEach((el) => { el.querySelector(".rec-in").value = el.dataset.exp; el.querySelector(".nonrec-in").value = 0; });
+      refresh();
+    };
+    refresh();
+
+    $("#valider").onclick = async () => {
+      const mvts = [], facts = [], manquantsTxt = [];
+      cards().forEach((el) => {
+        const d = readCard(el);
+        // tout l'attendu est soldé (récupéré ou non récupéré / facturé)
+        mvts.push({ prestation_id: id, sens: "retour", type_id: d.tid, unit_id: null, quantite: d.exp, par_user: state.user.id });
+        if (d.nonrec > 0) {
+          facts.push({ prestation_id: id, client_id: p.client_id || null, type_id: d.tid, motif: "perte", quantite: d.nonrec, prix_unitaire: d.prix, statut: "a_facturer" });
+          manquantsTxt.push(`- ${d.nom} : ${d.nonrec} non récupéré(s) (${eur(d.nonrec * d.prix)})`);
+        }
+      });
+      $("#valider").disabled = true;
+
+      // REMPLACEMENT idempotent : on efface d'abord les retours et les pertes déjà
+      // enregistrés pour cette prestation, puis on réécrit — c'est ce qui permet de
+      // corriger une récupération déjà validée sans doubler les quantités.
+      const delMvt = await sb.from("mouvements").delete().eq("prestation_id", id).eq("sens", "retour");
+      if (delMvt.error) { $("#valider").disabled = false; return toast(delMvt.error.message, "err"); }
+      const delF = await sb.from("facturations").delete().eq("prestation_id", id).eq("statut", "a_facturer").eq("motif", "perte");
+      if (delF.error) { $("#valider").disabled = false; return toast(delF.error.message, "err"); }
+
+      if (mvts.length) {
+        const { error } = await sb.from("mouvements").insert(mvts);
+        if (error) { $("#valider").disabled = false; return toast(error.message, "err"); }
+      }
+      if (facts.length) {
+        const { error } = await sb.from("facturations").insert(facts);
+        if (error) { $("#valider").disabled = false; return toast("Récup ok mais facturation : " + error.message, "err"); }
+      }
+      await sb.from("prestations").update({ statut: "recupere" }).eq("id", id);
+      // Auto-archivage si rien à facturer ; sinon on la ré-affiche dans « Écarts à traiter »
+      const archived = await maybeAutoArchive(id);
+      if (!archived) await sb.from("prestations").update({ archivee: false }).eq("id", id);
+
+      // Pas d'email généré côté livreur : l'écart part dans « Écarts à traiter »,
+      // et l'admin envoie le récap (adresse GreenLoop) via le bouton « Récap mail ».
+      if (manquantsTxt.length) {
+        toast("Écart enregistré → onglet « Écarts à traiter »", "ok");
+      } else {
+        toast(archived ? "Récupération soldée — prestation archivée ✔" : "Récupération complète ✔", "ok");
+      }
+      go("prestation/" + id);
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Rapport des manquants + facturation
+  // =========================================================================
+  async function viewManquants(id) {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Manquants") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const p = await db.prestation(id);
+    const bilan = await db.bilan(id);
+    const facts = await db.facturations(id);
+
+    // cache des noms de types (défini AVANT de construire le HTML)
+    const typeMap = {};
+    (await db.types()).forEach((t) => (typeMap[t.id] = t));
+    const typeName = (tid) => (typeMap[tid] ? typeMap[tid].nom : "Matériel");
+
+    const manquants = bilan.filter((b) => b.q_manquant > 0);
+    const openFacts = facts.filter((f) => f.statut === "a_facturer");
+    const totalFact = facts.filter((f) => f.statut !== "annule").reduce((s, f) => s + Number(f.montant), 0);
+
+    app.innerHTML =
+      topbar("À facturer · " + (p.libelle || ""), { back: "prestation/" + id }) +
+      `<main>
+        ${(manquants.length === 0 && openFacts.length === 0)
+          ? `<div class="card" style="text-align:center"><div style="font-size:34px">✅</div><b>Rien à facturer</b><div class="sub">Tout est réglé sur cette prestation.</div></div>`
+          : (manquants.length === 0
+            ? `<div class="card"><div class="sub">Aucun manquant nouveau à pointer — voir les lignes déjà à facturer ci-dessous.</div></div>`
+            : `<button class="btn block" id="mail-compta">✉️ Envoyer les manquants à la compta</button>
+             <div class="section-title">À réclamer / facturer</div>` +
+            manquants.map((b) => `
+              <div class="card">
+                <div class="row between">
+                  <div class="grow"><b>${esc(b.type_nom)}</b><div class="sub">${esc(b.categorie||"")} · ${b.q_sortie} sortis, ${b.q_retour} revenus</div></div>
+                  <span class="badge red">${b.q_manquant} manquant${b.q_manquant>1?"s":""}</span>
+                </div>
+                <div class="sub" style="margin-top:6px">Remplacement estimé : ${eur(b.q_manquant * b.prix_unitaire)} HT (${eur(b.prix_unitaire)} HT/u)</div>
+                <div class="btn-grid" style="margin-top:10px">
+                  <button class="btn warn sm" data-fact='${b.type_id}|casse'>Facturer (casse)</button>
+                  <button class="btn danger sm" data-fact='${b.type_id}|perte'>Facturer (perte)</button>
+                </div>
+              </div>`).join(""))
+        }
+
+        ${facts.length ? `<div class="section-title">Facturations enregistrées — total ${eur(totalFact)}</div>` +
+          facts.map((f) => `<div class="card"><div class="row between">
+              <div class="grow"><b>${f.quantite}× ${esc(typeName(f.type_id))}</b><div class="sub">${f.motif} · ${eur(f.montant)}</div></div>
+              <span class="badge ${f.statut==="facture"?"green":f.statut==="annule"?"gray":"amber"}">${f.statut.replace("_"," ")}</span>
+            </div></div>`).join("") : ""}
+      </main>`;
+
+    const mailBtn = $("#mail-compta");
+    if (mailBtn) mailBtn.onclick = async () => {
+      const compta = await db.param("email_compta");
+      if (!compta) return toast("Renseigne l'email de la compta dans Paramètres", "err");
+      const cli = p.clients ? p.clients.nom : "Client ?";
+      const lignes = manquants.map((b) => `- ${b.type_nom} : ${b.q_manquant} manquant(s) (${eur(b.q_manquant * b.prix_unitaire)})`).join("\n");
+      const total = manquants.reduce((s, b) => s + b.q_manquant * b.prix_unitaire, 0);
+      const body =
+`Prestation : ${p.libelle || ""}
+Client : ${cli}
+Date : ${dfr(p.date_presta)}
+
+Matériel manquant à facturer :
+${lignes}
+
+Total : ${eur(total)} HT`;
+      openMail(compta, `Manquants à facturer — ${cli} (${p.libelle || ""})`, body);
+    };
+
+    $$("[data-fact]").forEach((btn) => {
+      btn.onclick = async () => {
+        const [tid, motif] = btn.dataset.fact.split("|");
+        const b = bilan.find((x) => x.type_id === tid);
+        if (!b) return;
+        btn.disabled = true;
+        const { error } = await sb.from("facturations").insert({
+          prestation_id: id, type_id: tid, motif,
+          quantite: b.q_manquant, prix_unitaire: b.prix_unitaire, statut: "a_facturer",
+        });
+        if (error) { btn.disabled = false; return toast(error.message, "err"); }
+        toast("Ajouté à facturer ✔", "ok");
+        render();
+      };
+    });
+  }
+
+  // =========================================================================
+  //  VUE : Matériel (catalogue)
+  // =========================================================================
+  async function viewMateriel() {
+    const [types, soldes, archived] = await Promise.all([db.types(), db.soldeAll(), db.typesArchived()]);
+    const dehorsByType = {};
+    soldes.forEach((s) => (dehorsByType[s.type_id] = (dehorsByType[s.type_id] || 0) + s.solde));
+
+    const byCat = {};
+    types.forEach((t) => ((byCat[t.categorie || "Autres"] ||= []).push(t)));
+    const card = (t) => {
+      const dehors = dehorsByType[t.id] || 0;
+      const labo = (t.stock_total || 0) - dehors;
+      return `
+        <div class="card tap" onclick="location.hash='#/type/${t.id}'">
+          ${t.photo_url ? `<img src="${esc(t.photo_url)}" alt="" style="width:52px;height:52px;border-radius:10px;object-fit:cover;flex:0 0 auto;background:#eef0ee" />` : `<div style="width:52px;height:52px;border-radius:10px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:24px">📦</div>`}
+          <div class="grow"><h3>${esc(t.nom)}</h3>
+            <div class="sub">${t.code_qr ? "🏷️ " + esc(t.code_qr) : "sans QR"} · ${eur(t.prix_unitaire)} HT</div>
+            <div class="sub">Parc <b>${t.stock_total || 0}</b> · 🏭 Labo <b>${labo}</b> · 🚚 Dehors <b>${dehors}</b></div>
+          </div>
+          <div style="font-size:22px;color:#cbd5c9">›</div>
+        </div>`;
+    };
+    const body = Object.keys(byCat).sort().map((cat) =>
+      `<div class="section-title">${esc(cat)}</div>${byCat[cat].map(card).join("")}`).join("");
+
+    app.innerHTML =
+      topbar("Matériel") +
+      `<main>
+        <div class="btn-grid" style="margin-bottom:12px">
+          <button class="btn sec" onclick="location.hash='#/categories'">🏷️ Catégories</button>
+          <button class="btn sec" onclick="location.hash='#/tags'">🎟️ Tags / packs</button>
+          <button class="btn sec" id="csv">⬇︎ Export CSV</button>
+          ${isAdmin() ? `<button class="btn sec" onclick="location.hash='#/masse'">✏️ Édition en masse</button>` : ""}
+        </div>
+        ${types.length ? body : '<div class="empty"><div class="big">📦</div>Aucun matériel.</div>'}
+        ${archived.length ? `<button class="btn ghost block" style="margin-top:16px" onclick="location.hash='#/archives'">🗄 Matériel archivé (${archived.length})</button>` : ""}
+      </main>
+       <button class="fab" onclick="location.hash='#/type/new'">＋</button>`;
+    $("#csv").onclick = () => exportTypesCSV(types);
+  }
+
+  // =========================================================================
+  //  VUE : Édition en masse du matériel (tableau éditable + matrice de tags)
+  // =========================================================================
+  async function viewMasse() {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Édition en masse") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const [types, cats, tags, journalRows] = await Promise.all([db.types(), db.categories(), db.tags(), db.q("parc_journal")]);
+    const journaledIds = new Set((journalRows || []).map((j) => j.type_id)); // parc déjà initialisé -> verrouillé
+    const inCss = "width:100%;padding:6px 7px;font-size:13px;border:1px solid var(--line);border-radius:8px;background:#fff";
+    const catOptions = (sel) => `<option value="">—</option>` + cats.map((c) => `<option ${c.nom === sel ? "selected" : ""}>${esc(c.nom)}</option>`).join("");
+    const thumb = (t) => t.photo_url
+      ? `<img src="${esc(t.photo_url)}" alt="" style="width:32px;height:32px;border-radius:7px;object-fit:cover;flex:0 0 auto;background:#eef0ee" />`
+      : `<div style="width:32px;height:32px;border-radius:7px;flex:0 0 auto;background:#eef0ee;display:flex;align-items:center;justify-content:center;font-size:15px">📦</div>`;
+    const rowHtml = (t) => {
+      const tg = t.tags || [];
+      return `<tr data-id="${t.id || ""}">
+        <td style="position:sticky;left:0;background:#fff;padding:5px;min-width:180px;box-shadow:1px 0 0 var(--line)"><div style="display:flex;align-items:center;gap:6px">${thumb(t)}<input class="m-nom" value="${esc(t.nom || "")}" placeholder="Nom" style="${inCss}" /></div></td>
+        <td style="padding:5px"><select class="m-cat" style="${inCss};min-width:120px">${catOptions(t.categorie)}</select></td>
+        <td style="padding:5px"><input class="m-prix" type="number" step="0.01" value="${t.prix_unitaire || 0}" style="${inCss};width:78px" /></td>
+        <td style="padding:5px"><input class="m-code" value="${esc(t.code_qr || "")}" placeholder="auto" style="${inCss};width:120px;font-family:monospace" /></td>
+        <td style="padding:5px">${(() => {
+          const locked = !!(t.id && journaledIds.has(t.id));
+          const st = t.stock_total || 0;
+          return `<input class="m-parc" type="number" step="1" value="${st}" data-locked="${locked ? 1 : 0}" data-stock="${st}" ${locked ? "readonly" : ""} title="${locked ? "Parc verrouillé — ajuste via le journal du matériel" : "Parc initial (verrouillé après enregistrement)"}" style="${inCss};width:72px${locked ? ";background:#f1f3f0" : ""}" />`;
+        })()}</td>
+        <td style="padding:5px"><input class="m-dotfixe" type="number" step="1" min="0" value="${t.dotation_fixe || 0}" title="Quantité fixe pré-remplie à la sortie" style="${inCss};width:64px" /></td>
+        <td style="padding:5px"><input class="m-dotpax" type="number" step="1" min="0" value="${t.dotation_pax || 0}" title="1 exemplaire pour X personnes (0 = aucune)" style="${inCss};width:64px" /></td>
+        ${tags.map((tag) => `<td style="text-align:center;padding:5px"><input type="checkbox" class="m-tag" data-tag="${esc(tag.nom)}" ${tg.includes(tag.nom) ? "checked" : ""} style="width:20px;height:20px" /></td>`).join("")}
+        <td style="text-align:center;padding:5px"><input type="checkbox" class="m-actif" ${t.actif !== false ? "checked" : ""} style="width:20px;height:20px" /></td>
+        <td style="text-align:center;padding:5px"><button type="button" class="m-del" title="Supprimer" style="border:none;background:none;color:var(--danger);font-size:16px;cursor:pointer;padding:4px 8px">🗑</button></td>
+      </tr>`;
+    };
+    app.innerHTML =
+      topbar("Édition en masse", { back: "materiel" }) +
+      `<main>
+        <div class="sub" style="margin-bottom:8px">Modifie tout d'un coup : nom, catégorie, prix HT, code QR, parc initial et tags (cases à cocher). Fais défiler vers la droite pour voir toutes les colonnes. Le <b>parc</b> se saisit ici tant qu'il n'a jamais été initialisé (🔒 ensuite) ; après, il se corrige via le journal de la fiche.</div>
+        <div class="field-row" style="margin-bottom:10px">
+          <input id="mcat-new" placeholder="Nouvelle catégorie…" />
+          <button class="btn sm sec" id="mcat-add" style="flex:0 0 auto">＋ Catégorie</button>
+        </div>
+        <div style="overflow:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:12px;max-height:calc(100vh - 300px)">
+          <table style="border-collapse:separate;border-spacing:0;font-size:13px;background:#fff;white-space:nowrap">
+            <thead><tr>
+              <th style="position:sticky;left:0;top:0;z-index:3;background:#e9ebe7;padding:8px;text-align:left;box-shadow:1px 0 0 var(--line),0 1px 0 var(--line)">Nom</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Catégorie</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Prix HT €</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Code QR</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Parc</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)" title="Quantité fixe pré-remplie à la sortie">Dot. fixe</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)" title="1 pour X personnes">Dot. /pers</th>
+              ${tags.map((t) => `<th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">${esc(t.nom)}${t.is_base ? " ★" : ""}</th>`).join("")}
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Actif</th>
+              <th style="position:sticky;top:0;z-index:2;background:#e9ebe7;padding:8px;box-shadow:0 1px 0 var(--line)">Suppr.</th>
+            </tr></thead>
+            <tbody id="masse-body">${types.map(rowHtml).join("")}</tbody>
+          </table>
+        </div>
+        <button class="btn sec block" id="m-add" style="margin-top:10px">＋ Ajouter une ligne</button>
+        <button class="btn block" id="m-save" style="margin-top:8px">💾 Enregistrer tout</button>
+        <div class="sub" style="text-align:center;margin-top:6px">${types.length} matériel(s) · <a href="#/tags" style="color:var(--green)">gérer les tags</a></div>
+      </main>`;
+
+    $("#m-add").onclick = () => {
+      $("#masse-body").insertAdjacentHTML("beforeend", rowHtml({ actif: true, tags: [] }));
+      const rows = $$("#masse-body tr");
+      rows[rows.length - 1].querySelector(".m-nom").focus();
+    };
+
+    // Suppression d'une ligne (deux temps). Repli en archivage si un historique existe.
+    $("#masse-body").addEventListener("click", async (e) => {
+      const b = e.target.closest(".m-del");
+      if (!b) return;
+      const tr = b.closest("tr"), id = tr.dataset.id;
+      if (b.dataset.armed !== "1") {
+        b.dataset.armed = "1"; b.textContent = "❌ sûr ?";
+        setTimeout(() => { if (b.dataset.armed === "1") { b.dataset.armed = ""; b.textContent = "🗑"; } }, 3000);
+        return;
+      }
+      if (!id) { tr.remove(); return; } // ligne jamais enregistrée
+      b.disabled = true;
+      const { error } = await sb.from("materiel_types").delete().eq("id", id);
+      if (error) {
+        // référencé par des mouvements/facturations -> on archive plutôt que casser l'historique
+        const { error: e2 } = await sb.from("materiel_types").update({ actif: false }).eq("id", id);
+        if (e2) { b.disabled = false; b.dataset.armed = ""; b.textContent = "🗑"; return toast(e2.message, "err"); }
+        tr.remove(); return toast("Matériel archivé (un historique existe, données conservées)", "ok");
+      }
+      tr.remove(); toast("Matériel supprimé ✔", "ok");
+    });
+
+    // Ajout d'une catégorie à la volée (sans quitter l'écran ni perdre les modifs)
+    const catAdd = $("#mcat-add"), catInput = $("#mcat-new");
+    const addCat = async () => {
+      const nom = catInput.value.trim();
+      if (!nom) return;
+      if (cats.some((c) => _norm(c.nom) === _norm(nom))) { toast("Cette catégorie existe déjà", "err"); return; }
+      catAdd.disabled = true;
+      const { data, error } = await sb.from("materiel_categories").insert({ nom }).select().single();
+      catAdd.disabled = false;
+      if (error) return toast(error.message.includes("duplicate") ? "Cette catégorie existe déjà" : error.message, "err");
+      cats.push(data || { nom });
+      // ajoute l'option à toutes les listes déroulantes déjà affichées
+      $$("#masse-body .m-cat").forEach((sel) => sel.insertAdjacentHTML("beforeend", `<option>${esc(nom)}</option>`));
+      catInput.value = "";
+      toast(`Catégorie « ${nom} » ajoutée ✔`, "ok");
+    };
+    catAdd.onclick = addCat;
+    catInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); addCat(); } });
+    $("#m-save").onclick = async () => {
+      const rows = [];
+      const toInit = []; // parcs à initialiser (journal motif "initial")
+      $$("#masse-body tr").forEach((tr) => {
+        const nom = tr.querySelector(".m-nom").value.trim();
+        if (!nom) return; // ligne vide ignorée
+        let code = tr.querySelector(".m-code").value.trim();
+        // toutes les lignes portent un id (clés uniformes = requis par l'upsert groupé) ;
+        // une nouvelle ligne reçoit un id neuf -> insertion, une ligne existante -> mise à jour.
+        const id = tr.dataset.id || (crypto.randomUUID ? crypto.randomUUID() : ("" + Date.now() + Math.random()));
+        // Parc : verrouillé -> on garde la valeur actuelle inchangée ; sinon on prend la saisie.
+        const pInput = tr.querySelector(".m-parc");
+        const pLocked = pInput.dataset.locked === "1";
+        const pVal = pLocked ? (parseInt(pInput.dataset.stock) || 0) : (parseInt(pInput.value) || 0);
+        if (!pLocked && pVal > 0) toInit.push({ id, delta: pVal });
+        rows.push({
+          id,
+          nom,
+          categorie: tr.querySelector(".m-cat").value || null,
+          prix_unitaire: parseFloat(tr.querySelector(".m-prix").value) || 0,
+          code_qr: code || slugCode(nom),
+          tags: Array.from(tr.querySelectorAll(".m-tag")).filter((c) => c.checked).map((c) => c.dataset.tag),
+          actif: tr.querySelector(".m-actif").checked,
+          stock_total: pVal,
+          dotation_fixe: parseInt(tr.querySelector(".m-dotfixe").value) || 0,
+          dotation_pax: parseInt(tr.querySelector(".m-dotpax").value) || 0,
+        });
+      });
+      if (!rows.length) return toast("Rien à enregistrer", "err");
+      $("#m-save").disabled = true;
+      const { error } = await sb.from("materiel_types").upsert(rows, { onConflict: "id" });
+      if (error) { $("#m-save").disabled = false; return toast(error.message.includes("duplicate") || error.code === "23505" ? "Un code QR est en double — corrige-le" : error.message, "err"); }
+      // Inscrit la saisie initiale du parc au journal (verrouille pour la suite)
+      if (toInit.length) {
+        await sb.from("parc_journal").insert(toInit.map((x) => ({
+          type_id: x.id, delta: x.delta, motif: "initial",
+          commentaire: "Saisie initiale (édition en masse)", par_user: state.user.id,
+        })));
+      }
+      $("#m-save").disabled = false;
+      toast(`${rows.length} matériel(s) enregistré(s) ✔`, "ok");
+      render();
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Matériel archivé (réactivation / suppression définitive)
+  // =========================================================================
+  async function viewArchives() {
+    const archived = await db.typesArchived();
+    app.innerHTML =
+      topbar("Matériel archivé", { back: "materiel" }) +
+      `<main>
+        ${archived.length ? `<div class="sub" style="margin-bottom:8px">Ces matériels sont masqués mais leur historique est conservé. Tu peux les réactiver.</div>` +
+          archived.map((t) => `
+            <div class="card">
+              <div class="row between" style="margin-bottom:8px">
+                <div class="grow"><b>${esc(t.nom)}</b><div class="sub">${esc(t.categorie || "")}${t.code_qr ? " · " + esc(t.code_qr) : ""}</div></div>
+              </div>
+              <div class="btn-grid">
+                <button class="btn sec" data-reactiver="${t.id}">↩︎ Réactiver</button>
+                <button class="btn ghost" data-suppr="${t.id}" style="color:var(--danger)">🗑 Supprimer définitivement</button>
+              </div>
+            </div>`).join("")
+          : `<div class="empty"><div class="big">🗄</div>Aucun matériel archivé.</div>`}
+      </main>`;
+
+    $$("[data-reactiver]").forEach((b) => b.onclick = async () => {
+      const { error } = await sb.from("materiel_types").update({ actif: true }).eq("id", b.dataset.reactiver);
+      toast(error ? error.message : "Matériel réactivé ✔", error ? "err" : "ok");
+      if (!error) render();
+    });
+    $$("[data-suppr]").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) { armed = true; b.textContent = "Confirmer ?"; setTimeout(() => { armed = false; b.textContent = "🗑 Supprimer définitivement"; }, 3000); return; }
+        const { error } = await sb.from("materiel_types").delete().eq("id", b.dataset.suppr);
+        if (error) return toast("Impossible : ce matériel a un historique. Il reste archivé.", "err");
+        toast("Supprimé définitivement ✔", "ok"); render();
+      };
+    });
+  }
+
+  // =========================================================================
+  //  VUE : Gestion des catégories de matériel
+  // =========================================================================
+  async function viewCategories() {
+    const cats = await db.categories();
+    app.innerHTML =
+      topbar("Catégories", { back: "materiel" }) +
+      `<main>
+        <div class="card">
+          <label>Nouvelle catégorie</label>
+          <div class="field-row">
+            <input id="c-new" placeholder="Ex : Contenants" />
+            <button class="btn sm" id="c-add" style="flex:0 0 auto">Ajouter</button>
+          </div>
+        </div>
+        <div class="section-title">Catégories existantes</div>
+        ${cats.length ? cats.map((c) => `
+          <div class="card"><div class="row" style="gap:8px">
+            <input class="cat-nom" data-id="${c.id}" data-old="${esc(c.nom)}" value="${esc(c.nom)}" style="flex:1" />
+            <button class="btn sm sec cat-save" data-id="${c.id}" style="flex:0 0 auto">✓</button>
+            <button class="btn sm ghost cat-del" data-id="${c.id}" data-nom="${esc(c.nom)}" style="flex:0 0 auto;color:var(--danger)">🗑</button>
+          </div></div>`).join("") : '<div class="sub">Aucune catégorie pour l\'instant.</div>'}
+      </main>`;
+
+    $("#c-add").onclick = async () => {
+      const nom = $("#c-new").value.trim();
+      if (!nom) return;
+      const { error } = await sb.from("materiel_categories").insert({ nom });
+      if (error) return toast(error.message.includes("duplicate") ? "Cette catégorie existe déjà" : error.message, "err");
+      toast("Catégorie ajoutée ✔", "ok"); render();
+    };
+    $$(".cat-save").forEach((b) => b.onclick = async () => {
+      const inp = $(`.cat-nom[data-id="${b.dataset.id}"]`);
+      const nouveau = inp.value.trim(), ancien = inp.dataset.old;
+      if (!nouveau || nouveau === ancien) return;
+      const e1 = (await sb.from("materiel_categories").update({ nom: nouveau }).eq("id", b.dataset.id)).error;
+      if (e1) return toast(e1.message, "err");
+      await sb.from("materiel_types").update({ categorie: nouveau }).eq("categorie", ancien);
+      toast("Catégorie renommée ✔", "ok"); render();
+    });
+    $$(".cat-del").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) { armed = true; b.textContent = "Confirmer ?"; setTimeout(() => { armed = false; b.textContent = "🗑"; }, 3000); return; }
+        await sb.from("materiel_types").update({ categorie: null }).eq("categorie", b.dataset.nom);
+        const { error } = await sb.from("materiel_categories").delete().eq("id", b.dataset.id);
+        if (error) return toast(error.message, "err");
+        toast("Catégorie supprimée ✔", "ok"); render();
+      };
+    });
+  }
+
+  // =========================================================================
+  //  VUE : Tags / packs livreur (gestion)
+  // =========================================================================
+  async function viewTags() {
+    const tags = await db.tags();
+    app.innerHTML =
+      topbar("Tags / packs", { back: "materiel" }) +
+      `<main>
+        <div class="card">
+          <label>Nouveau tag</label>
+          <div class="field-row">
+            <input id="tg-new" placeholder="Ex : Mariages" />
+            <button class="btn sm" id="tg-add" style="flex:0 0 auto">Ajouter</button>
+          </div>
+          <div class="sub" style="margin-top:6px">Un tag « base » (★) reste toujours visible à la sortie, en plus du pack choisi (ex. les caisses communes).</div>
+        </div>
+        <div class="section-title">Tags existants</div>
+        ${tags.length ? tags.map((t) => `
+          <div class="card">
+            <div class="row" style="gap:8px">
+              <input class="tg-nom" data-id="${t.id}" data-old="${esc(t.nom)}" value="${esc(t.nom)}" style="flex:1" />
+              <button class="btn sm sec tg-save" data-id="${t.id}" style="flex:0 0 auto">✓</button>
+              <button class="btn sm ghost tg-del" data-id="${t.id}" data-nom="${esc(t.nom)}" style="flex:0 0 auto;color:var(--danger)">🗑</button>
+            </div>
+            <button type="button" class="tg-base" data-id="${t.id}" data-base="${t.is_base}" style="${chipCss(t.is_base)};margin-top:8px">★ Pack de base ${t.is_base ? ": OUI" : ": non"}</button>
+          </div>`).join("") : '<div class="sub">Aucun tag pour l\'instant.</div>'}
+      </main>`;
+
+    $("#tg-add").onclick = async () => {
+      const nom = $("#tg-new").value.trim();
+      if (!nom) return;
+      const { error } = await sb.from("materiel_tags").insert({ nom });
+      if (error) return toast(error.message.includes("duplicate") ? "Ce tag existe déjà" : error.message, "err");
+      toast("Tag ajouté ✔", "ok"); render();
+    };
+    $$(".tg-base").forEach((b) => b.onclick = async () => {
+      const next = b.dataset.base !== "true";
+      const { error } = await sb.from("materiel_tags").update({ is_base: next }).eq("id", b.dataset.id);
+      if (error) return toast(error.message, "err");
+      toast("Réglage enregistré ✔", "ok"); render();
+    });
+    $$(".tg-save").forEach((b) => b.onclick = async () => {
+      const inp = $(`.tg-nom[data-id="${b.dataset.id}"]`);
+      const nouveau = inp.value.trim(), ancien = inp.dataset.old;
+      if (!nouveau || nouveau === ancien) return;
+      // renomme le tag partout : dans les matériels et dans la correspondance type Sextan
+      const { data: aff } = await sb.from("materiel_types").select("id,tags").contains("tags", [ancien]);
+      for (const m of (aff || [])) await sb.from("materiel_types").update({ tags: (m.tags || []).map((x) => x === ancien ? nouveau : x) }).eq("id", m.id);
+      const e1 = (await sb.from("materiel_tags").update({ nom: nouveau }).eq("id", b.dataset.id)).error;
+      if (e1) return toast(e1.message.includes("duplicate") ? "Ce tag existe déjà" : e1.message, "err");
+      await sb.from("sextan_type_tags").update({ tag: nouveau }).eq("tag", ancien);
+      toast("Tag renommé ✔", "ok"); render();
+    });
+    $$(".tg-del").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) { armed = true; b.textContent = "Confirmer ?"; setTimeout(() => { armed = false; b.textContent = "🗑"; }, 3000); return; }
+        const { data: aff } = await sb.from("materiel_types").select("id,tags").contains("tags", [b.dataset.nom]);
+        for (const m of (aff || [])) await sb.from("materiel_types").update({ tags: (m.tags || []).filter((x) => x !== b.dataset.nom) }).eq("id", m.id);
+        await sb.from("sextan_type_tags").update({ tag: null }).eq("tag", b.dataset.nom);
+        const { error } = await sb.from("materiel_tags").delete().eq("id", b.dataset.id);
+        if (error) return toast(error.message, "err");
+        toast("Tag supprimé ✔", "ok"); render();
+      };
+    });
+  }
+
+  // =========================================================================
+  //  VUE : Journal du parc d'un matériel
+  // =========================================================================
+  async function viewParcJournal(tid) {
+    const t = await db.type(tid);
+    const [journal, mvts] = await Promise.all([db.parcJournal(tid), db.movementsByType(tid)]);
+    const admin = isAdmin();
+    const items = [
+      ...journal.map((j) => ({ at: j.created_at, kind: "parc", j })),
+      ...mvts.map((m) => ({ at: m.created_at, kind: "mvt", m })),
+    ].sort((a, b) => (a.at < b.at ? 1 : -1));
+
+    const parcLine = (j) => {
+      const sign = j.delta > 0 ? "+" : "";
+      return `<div class="mat-line" data-pj="${j.id}">
+        <div class="name" style="flex:1"><b>🧮 ${esc(MOTIF_LABEL[j.motif] || j.motif)} : ${sign}${j.delta}</b>
+          <small>${dfrt(j.created_at)}${j.commentaire ? " · " + esc(j.commentaire) : ""}</small></div>
+        ${admin ? `<button class="btn sm ghost pj-edit" data-id="${j.id}" style="flex:0 0 auto">✏️</button>` : ""}
+      </div>`;
+    };
+    const mvtLine = (m) => {
+      const cli = m.prestations && m.prestations.clients ? m.prestations.clients.nom : "";
+      const pres = m.prestations ? m.prestations.libelle : "";
+      return `<div class="mat-line"><div class="name" style="flex:1">
+        <b>${m.sens === "sortie" ? "📤 Sortie" : "📥 Retour"} ${m.quantite}</b>
+        <small>${dfrt(m.created_at)}${cli ? " · " + esc(cli) : ""}${pres ? " · " + esc(pres) : ""}</small></div></div>`;
+    };
+
+    app.innerHTML =
+      topbar("Journal · " + t.nom, { back: "type/" + tid }) +
+      `<main>
+        <div class="card"><div class="row between"><b>Parc actuel</b><b style="font-size:20px">${t.stock_total || 0}</b></div></div>
+        ${admin ? `
+          <div class="card">
+            <div class="sub" style="font-weight:700;margin-bottom:6px">Ajuster le parc</div>
+            <div class="field-row">
+              <div><label style="margin-top:0">Variation</label><input id="adj-delta" type="number" placeholder="+10 / −3" /></div>
+              <div><label style="margin-top:0">Motif</label>
+                <select id="adj-motif">
+                  <option value="rachat">Rachat</option>
+                  <option value="perte">Perte (non retrouvé)</option>
+                  <option value="casse_salarie">Casse salarié</option>
+                  <option value="inventaire">Correction d'inventaire</option>
+                  <option value="autre">Autre</option>
+                </select></div>
+            </div>
+            <input id="adj-com" placeholder="Commentaire (optionnel)" style="margin-top:6px" />
+            <button class="btn block" id="adj-save" style="margin-top:8px">Enregistrer l'ajustement</button>
+          </div>` : `<div class="sub" style="margin:4px">🔒 Seul un administrateur peut ajuster le parc.</div>`}
+        <div class="section-title">Historique</div>
+        <div class="card" id="tl">${items.length ? items.map((it) => it.kind === "parc" ? parcLine(it.j) : mvtLine(it.m)).join("") : '<div class="sub">Aucun mouvement.</div>'}</div>
+      </main>`;
+
+    if (admin) {
+      $("#adj-save").onclick = async () => {
+        const delta = parseInt($("#adj-delta").value);
+        if (!delta) return toast("Indique une variation (ex : 10 ou -3)", "err");
+        const { error } = await sb.from("parc_journal").insert({
+          type_id: tid, delta, motif: $("#adj-motif").value,
+          commentaire: $("#adj-com").value.trim() || null, par_user: state.user.id,
+        });
+        if (error) return toast(error.message, "err");
+        await recomputeStock(tid);
+        toast("Parc ajusté ✔", "ok"); render();
+      };
+      $$(".pj-edit").forEach((b) => b.onclick = () => editParcEntry(b.dataset.id, journal, tid));
+    }
+  }
+
+  function editParcEntry(id, journal, tid) {
+    const j = journal.find((x) => x.id === id);
+    const line = $(`[data-pj="${id}"]`);
+    if (!j || !line) return;
+    line.innerHTML = `<div style="flex:1">
+      <div class="field-row">
+        <input class="pe-delta" type="number" value="${j.delta}" />
+        <select class="pe-motif">${Object.keys(MOTIF_LABEL).map((m) => `<option value="${m}" ${j.motif === m ? "selected" : ""}>${esc(MOTIF_LABEL[m])}</option>`).join("")}</select>
+      </div>
+      <input class="pe-com" value="${esc(j.commentaire || "")}" placeholder="Commentaire" style="margin-top:6px" />
+      <div class="btn-grid" style="margin-top:6px">
+        <button class="btn sec pe-save">Enregistrer</button>
+        <button class="btn ghost pe-del" style="color:var(--danger)">Supprimer</button>
+      </div></div>`;
+    line.querySelector(".pe-save").onclick = async () => {
+      const delta = parseInt(line.querySelector(".pe-delta").value) || 0;
+      const { error } = await sb.from("parc_journal").update({
+        delta, motif: line.querySelector(".pe-motif").value,
+        commentaire: line.querySelector(".pe-com").value.trim() || null,
+      }).eq("id", id);
+      if (error) return toast(error.message, "err");
+      await recomputeStock(tid); toast("Modifié ✔", "ok"); render();
+    };
+    line.querySelector(".pe-del").onclick = async () => {
+      const { error } = await sb.from("parc_journal").delete().eq("id", id);
+      if (error) return toast(error.message, "err");
+      await recomputeStock(tid); toast("Entrée supprimée ✔", "ok"); render();
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Espace admin (équipe + réglages)
+  // =========================================================================
+  async function viewAdmin() {
+    if (!isAdmin()) {
+      app.innerHTML = topbar("Admin") + `<main><div class="card">🔒 Réservé aux administrateurs.</div></main>`;
+      return;
+    }
+    const [users, compta, recapEmails, recapFreq, aValider, adminTags, curMap, typeRows] = await Promise.all([
+      db.usersList(), db.param("email_compta"), db.param("recap_emails"), db.param("recap_frequence"),
+      db.q("clients", (q) => q.eq("sextan_auto", true).order("nom")),
+      db.tags(), db.typeTagMap(),
+      db.q("prestations", (q) => q.not("type_presta", "is", null)),
+    ]);
+    const freq = recapFreq || "1_15";
+    const distinctTypes = [...new Set((typeRows || []).map((p) => p.type_presta).filter(Boolean))].sort();
+    const mapOf = {}; (curMap || []).forEach((m) => (mapOf[m.sextan_type] = m.tags || []));
+    const freqOpts = [["1_15", "Le 1ᵉʳ et le 15 du mois"], ["1", "Le 1ᵉʳ du mois"], ["15", "Le 15 du mois"], ["hebdo", "Chaque lundi"], ["off", "Désactivé (aucun envoi)"]];
+    app.innerHTML =
+      topbar("Espace admin") +
+      `<main>
+        <div class="section-title">Comptes (${users.length})</div>
+        ${users.map((u) => `
+          <div class="card" data-uid="${u.id}">
+            <label style="margin-top:0">Nom${u.id === state.user.id ? " (toi)" : ""}</label>
+            <input class="u-nom" value="${esc(u.nom || "")}" placeholder="Nom du membre" />
+            <div class="field-row" style="margin-top:8px">
+              <div><label style="margin-top:0">Rôle</label>
+                <select class="u-role">
+                  <option value="livreur" ${(u.role !== "admin" && u.role !== "preparateur") ? "selected" : ""}>Livreur</option>
+                  <option value="preparateur" ${u.role === "preparateur" ? "selected" : ""}>Préparateur</option>
+                  <option value="admin" ${u.role === "admin" ? "selected" : ""}>Administrateur</option>
+                </select></div>
+              <div><label style="margin-top:0">Accès</label>
+                <select class="u-actif">
+                  <option value="1" ${u.actif !== false ? "selected" : ""}>Actif</option>
+                  <option value="0" ${u.actif === false ? "selected" : ""}>Désactivé</option>
+                </select></div>
+            </div>
+            <button class="btn sec block u-save" data-uid="${u.id}" style="margin-top:8px">Enregistrer</button>
+            ${u.id === state.user.id ? "" : `<button class="btn ghost block u-del" data-uid="${u.id}" data-nom="${esc(u.nom || "ce membre")}" style="margin-top:8px;color:var(--danger)">🗑 Supprimer le compte</button>`}
+          </div>`).join("")}
+        <div class="card"><div class="sub">Un désactivé garde son compte mais ne peut plus se connecter. « Supprimer le compte » l'efface définitivement (connexion + profil) — action irréversible. La création d'un compte se fait par la personne elle-même (écran de connexion → « Créer un compte »). Le changement de mot de passe/e-mail passe par la console Supabase.</div></div>
+        <div class="section-title">Clients importés de Sextan à valider${aValider.length ? ` (${aValider.length})` : ""}</div>
+        ${aValider.length ? aValider.map((c) => `
+          <div class="card"><div class="row between">
+            <div class="grow"><b>${esc(c.nom)}</b><div class="sub">Créé automatiquement · ${c.type_client === "fixe" ? "Fixe" : "Ponctuel"} par défaut${c.email ? " · " + esc(c.email) : ""}</div></div>
+          </div>
+          <div class="btn-grid" style="margin-top:8px">
+            <button class="btn sec" onclick="location.hash='#/client/${c.id}/edit'">Régler la fiche</button>
+            <button class="btn ghost valider-cli" data-id="${c.id}">Valider tel quel</button>
+          </div></div>`).join("") : `<div class="card"><div class="sub">Aucun client en attente. Les prestations Sextan sont importées automatiquement chaque heure ; un nouveau client apparaît ici pour que tu règles son type (fixe/ponctuel) et ses adresses.</div></div>`}
+
+        <div class="section-title">Facturation</div>
+        <div class="card">
+          <label>Email du service comptabilité</label>
+          <input id="a-compta" type="email" value="${esc(compta)}" placeholder="compta@briffe.me" />
+          <button class="btn block" id="a-compta-save" style="margin-top:8px">Enregistrer</button>
+        </div>
+
+        <div class="section-title">Récap contenants détenus</div>
+        <div class="card">
+          <div class="sub" style="margin-bottom:8px">Récap automatique par mail des contenants détenus par <b>tous les clients</b> (fixes et ponctuels, pour repérer les commandes non récupérées).</div>
+          <label>Fréquence d'envoi</label>
+          <select id="a-recap-freq">
+            ${freqOpts.map(([v, lib]) => `<option value="${v}" ${freq === v ? "selected" : ""}>${lib}</option>`).join("")}
+          </select>
+          <label style="margin-top:12px">Destinataires (une adresse par ligne)</label>
+          <textarea id="a-recap" rows="3" placeholder="antoine@briffe.me">${esc((recapEmails || "").split(/[,;\n]/).map((s) => s.trim()).filter(Boolean).join("\n"))}</textarea>
+          <div class="sub" style="margin-top:4px">Chaque adresse doit exister dans les contacts Briffe. Envoi vers 8h (heure de Paris).</div>
+          <button class="btn block" id="a-recap-save" style="margin-top:8px">Enregistrer les réglages du récap</button>
+        </div>
+
+        <div class="section-title">Packs présélectionnés par type de prestation (Sextan)</div>
+        <div class="card">
+          <div class="sub" style="margin-bottom:8px">Associe chaque type de prestation Sextan à <b>un ou plusieurs packs</b> : à la sortie, le livreur verra ces packs déjà filtrés (il pourra en changer librement).</div>
+          ${distinctTypes.length ? distinctTypes.map((ty) => `
+            <div style="margin-bottom:12px">
+              <b style="word-break:break-word">${esc(ty)}</b>
+              <div class="ttag-group" data-type="${esc(ty)}" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:5px">
+                ${adminTags.map((tg) => { const on = (mapOf[ty] || []).includes(tg.nom); return `<button type="button" class="ttag" data-tag="${esc(tg.nom)}" data-on="${on ? "1" : "0"}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
+              </div>
+            </div>`).join("") + `<button class="btn block" id="a-map-save" style="margin-top:8px">Enregistrer les correspondances</button>`
+            : `<div class="sub">Les types apparaîtront ici dès que des prestations Sextan seront synchronisées avec leur type. (Sinon, ça se remplit tout seul au prochain import.)</div>`}
+        </div>
+      </main>`;
+    $$(".u-save").forEach((b) => b.onclick = async () => {
+      const card = b.closest("[data-uid]"), uid = b.dataset.uid;
+      const nom = card.querySelector(".u-nom").value.trim();
+      const role = card.querySelector(".u-role").value;
+      const actif = card.querySelector(".u-actif").value === "1";
+      if (uid === state.user.id && role !== "admin") return toast("Tu ne peux pas retirer ton propre rôle admin.", "err");
+      if (uid === state.user.id && !actif) return toast("Tu ne peux pas désactiver ton propre compte.", "err");
+      b.disabled = true;
+      const { error } = await sb.from("profiles").update({ nom: nom || null, role, actif }).eq("id", uid);
+      b.disabled = false;
+      if (error) return toast(error.message, "err");
+      toast("Compte enregistré ✔", "ok"); render();
+    });
+    $$(".u-del").forEach((b) => {
+      let armed = false;
+      b.onclick = async () => {
+        if (!armed) {
+          armed = true;
+          b.textContent = `Confirmer la suppression de ${b.dataset.nom} ?`;
+          b.classList.remove("ghost"); b.classList.add("danger");
+          setTimeout(() => { if (!armed) return; armed = false; b.textContent = "🗑 Supprimer le compte"; b.classList.add("ghost"); b.classList.remove("danger"); }, 4500);
+          return;
+        }
+        b.disabled = true;
+        try {
+          const { data: sess } = await sb.auth.getSession();
+          const token = sess && sess.session ? sess.session.access_token : "";
+          const res = await fetch(CFG.SUPABASE_URL + "/functions/v1/admin-delete-user", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token, "apikey": CFG.SUPABASE_ANON_KEY },
+            body: JSON.stringify({ user_id: b.dataset.uid }),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok || out.error) throw new Error(out.error || ("HTTP " + res.status));
+          toast("Compte supprimé ✔", "ok"); render();
+        } catch (e) {
+          b.disabled = false;
+          toast("Suppression impossible : " + (e.message || e), "err");
+        }
+      };
+    });
+    $$(".valider-cli").forEach((b) => b.onclick = async () => {
+      b.disabled = true;
+      const { error } = await sb.from("clients").update({ sextan_auto: false }).eq("id", b.dataset.id);
+      if (error) { b.disabled = false; return toast(error.message, "err"); }
+      toast("Client validé ✔", "ok"); render();
+    });
+    $("#a-compta-save").onclick = async () => {
+      const { error } = await db.setParam("email_compta", $("#a-compta").value.trim());
+      toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
+    };
+    $("#a-recap-save").onclick = async () => {
+      const list = $("#a-recap").value.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean).join(",");
+      const f = $("#a-recap-freq").value;
+      const [r1, r2] = await Promise.all([db.setParam("recap_emails", list), db.setParam("recap_frequence", f)]);
+      const err = (r1 && r1.error) || (r2 && r2.error);
+      toast(err ? err.message : "Réglages du récap enregistrés ✔", err ? "err" : "ok");
+    };
+    $$(".ttag-group .ttag").forEach((b) => b.onclick = () => {
+      b.dataset.on = b.dataset.on === "1" ? "0" : "1";
+      b.style.cssText = chipCss(b.dataset.on === "1");
+    });
+    const mapSave = $("#a-map-save");
+    if (mapSave) mapSave.onclick = async () => {
+      const rows = $$(".ttag-group").map((g) => ({
+        sextan_type: g.dataset.type,
+        tags: Array.from(g.querySelectorAll(".ttag")).filter((c) => c.dataset.on === "1").map((c) => c.dataset.tag),
+      }));
+      const { error } = await sb.from("sextan_type_tags").upsert(rows, { onConflict: "sextan_type" });
+      toast(error ? error.message : "Correspondances enregistrées ✔", error ? "err" : "ok");
+    };
+  }
+
+  // Export CSV (nom;categorie;code_qr;prix) pour fusion Brother P-touch Editor
+  function exportTypesCSV(types) {
+    const head = "nom;categorie;code_qr;prix_remplacement";
+    const lines = types.map((t) =>
+      [t.nom, t.categorie || "", t.code_qr || "", String(t.prix_unitaire).replace(".", ",")]
+        .map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(";")
+    );
+    const csv = "﻿" + [head, ...lines].join("\r\n"); // BOM pour Excel/Brother
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "greenloop-materiel.csv";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }
+
+  // Redimensionne/compresse une image côté client avant envoi (photos téléphone = lourdes)
+  function resizeImage(file, maxDim = 1200, quality = 0.82) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) { height = Math.round(height * maxDim / width); width = maxDim; }
+        else if (height >= width && height > maxDim) { width = Math.round(width * maxDim / height); height = maxDim; }
+        const c = document.createElement("canvas");
+        c.width = width; c.height = height;
+        c.getContext("2d").drawImage(img, 0, 0, width, height);
+        c.toBlob((b) => b ? resolve(b) : reject(new Error("conversion échouée")), "image/jpeg", quality);
+        URL.revokeObjectURL(img.src);
+      };
+      img.onerror = () => reject(new Error("image illisible"));
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  // Génère un code lisible à partir d'un nom (ex "Caisse Araven 20L" -> "GL-CAISSEARAVEN20L")
+  function slugCode(nom) {
+    const base = (nom || "")
+      .normalize("NFD").replace(/[̀-ͯ]/g, "")   // enlève les accents
+      .toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 18);
+    return "GL-" + (base || "MAT");
+  }
+
+  async function viewTypeDetail(tid) {
+    const isNew = tid === "new";
+    let t = { nom: "", categorie: "", unite: "pièce", prix_unitaire: 0, code_qr: "", stock_total: 0, tags: [] };
+    const cats = await db.categories();
+    const allTags = await db.tags();
+    let soldes = [], clientsMap = {}, journal = [];
+    if (!isNew) {
+      t = await db.type(tid);
+      const [allSoldes, clients, j] = await Promise.all([db.soldeAll(), db.clients(), db.parcJournal(tid)]);
+      soldes = allSoldes.filter((s) => s.type_id === tid && s.solde !== 0);
+      clients.forEach((c) => (clientsMap[c.id] = c.nom));
+      journal = j;
+    }
+    const dehors = soldes.reduce((a, s) => a + s.solde, 0);
+    const labo = (t.stock_total || 0) - dehors;
+    // Le parc est "verrouillé" dès qu'il a été initialisé (journal non vide)
+    const parkLocked = !isNew && journal.length > 0;
+
+    app.innerHTML =
+      topbar(isNew ? "Nouveau matériel" : t.nom, { back: "materiel" }) +
+      `<main>
+        <div class="card">
+          <label>Nom</label><input id="t-nom" value="${esc(t.nom)}" placeholder="Ex : Caisse Araven 20L" />
+          <label>Catégorie</label>
+          <select id="t-cat">
+            <option value="">— Choisir —</option>
+            ${cats.map((c) => `<option value="${esc(c.nom)}" ${t.categorie === c.nom ? "selected" : ""}>${esc(c.nom)}</option>`).join("")}
+            <option value="__new__">＋ Nouvelle catégorie…</option>
+          </select>
+          <input id="t-cat-new" placeholder="Nom de la nouvelle catégorie" style="display:none;margin-top:6px" />
+          <div class="field-row">
+            <div><label>Prix de remplacement HT (€)</label><input id="t-prix" type="number" step="0.01" value="${t.prix_unitaire}" /></div>
+            <div><label>Quantité totale (parc)${parkLocked ? " 🔒" : ""}</label>
+              <input id="t-stock" type="number" step="1" value="${t.stock_total || 0}" ${parkLocked ? "readonly style=\"background:#f1f3f0\"" : ""} /></div>
+          </div>
+          ${parkLocked ? `<div class="sub" style="margin-top:-4px">Le parc est verrouillé après la 1ʳᵉ saisie. Toute modification passe par le <b>journal du parc</b> (admin) avec justification.</div>` : `<div class="sub" style="margin-top:-4px">Première saisie du parc : indique la quantité possédée. Ensuite, elle ne sera modifiable que par un admin avec justification.</div>`}
+          <label>Tags / packs livreur</label>
+          <div id="t-tags" style="display:flex;flex-wrap:wrap;gap:6px">
+            ${allTags.map((tg) => { const on = (t.tags || []).includes(tg.nom); return `<button type="button" class="tagchip" data-tag="${esc(tg.nom)}" style="${chipCss(on)}">${esc(tg.nom)}${tg.is_base ? " ★" : ""}</button>`; }).join("")}
+          </div>
+          <div class="sub" style="margin-top:4px">Coche les packs où ce matériel doit apparaître à la sortie (Cocktails, Buffets…). ★ = pack de base (toujours visible). <a href="#/tags" style="color:var(--green)">Gérer les tags</a></div>
+          <label>Dotation (pré-remplissage à la sortie)</label>
+          <div class="field-row">
+            <div><label style="margin-top:0">Quantité fixe</label><input id="t-dotfixe" type="number" step="1" min="0" value="${t.dotation_fixe || 0}" /></div>
+            <div><label style="margin-top:0">1 pour X pers.</label><input id="t-dotpax" type="number" step="1" min="0" value="${t.dotation_pax || 0}" placeholder="0 = aucune" /></div>
+          </div>
+          <div class="sub" style="margin-top:-4px">À la sortie d'une prestation AO, la quantité est pré-remplie = fixe + arrondi(nb de convives ÷ « 1 pour X »). Laisse 0 pour ne pas doter ce matériel.</div>
+          <label>Code QR (identique sur tous les exemplaires de ce type)</label>
+          <div class="field-row">
+            <input id="t-code" value="${esc(t.code_qr||"")}" placeholder="GL-…" style="font-family:monospace" />
+            <button class="btn sm sec" id="gen-code" style="flex:0 0 auto">Auto</button>
+          </div>
+          <button class="btn block" id="save">${isNew?"Créer":"Enregistrer"}</button>
+        </div>
+
+        ${!isNew ? `
+          <div class="section-title">Stock à l'instant T</div>
+          <div class="stat">
+            <div class="box"><div class="n">${t.stock_total || 0}</div><div class="l">Parc</div></div>
+            <div class="box"><div class="n green">${labo}</div><div class="l">🏭 Labo</div></div>
+            <div class="box"><div class="n ${dehors ? "amber" : ""}">${dehors}</div><div class="l">🚚 Dehors</div></div>
+          </div>
+          ${soldes.length ? `<div class="card" style="margin-top:10px">
+            <div class="sub" style="font-weight:700;margin-bottom:4px">Détenu par client</div>
+            ${soldes.sort((a, b) => b.solde - a.solde).map((s) => `<div class="mat-line" onclick="location.hash='#/client/${s.client_id}'" style="cursor:pointer">
+              <div class="name" style="flex:1">${esc(clientsMap[s.client_id] || "Client ?")}</div>
+              <span class="badge amber">${s.solde}</span></div>`).join("")}
+          </div>` : `<div class="sub" style="margin-top:8px">Aucun exemplaire chez un client actuellement.</div>`}
+          ${labo < 0 ? `<div class="sub" style="color:var(--danger);margin-top:8px">⚠️ « Dehors » dépasse le parc — ajuste le parc via le journal.</div>` : ""}
+          <button class="btn sec block" style="margin-top:12px" onclick="location.hash='#/journal/${tid}'">📜 Journal du parc</button>
+        ` : ""}
+
+        ${!isNew ? `
+          <div class="section-title">Photo</div>
+          <div class="card">
+            <div id="photo-wrap">${t.photo_url ? `<img src="${esc(t.photo_url)}" alt="photo" style="width:100%;border-radius:12px;display:block" />` : `<div class="sub" style="text-align:center;padding:16px">Aucune photo</div>`}</div>
+            <input id="photo-cam" type="file" accept="image/*" capture="environment" style="display:none" />
+            <input id="photo-gal" type="file" accept="image/*" style="display:none" />
+            <div class="btn-grid" style="margin-top:8px">
+              <button class="btn sec" id="photo-cam-btn">📷 Prendre une photo</button>
+              <button class="btn sec" id="photo-gal-btn">🖼️ Galerie</button>
+            </div>
+            ${t.photo_url ? `<button class="btn ghost block" id="photo-del" style="color:var(--danger);margin-top:8px">Supprimer la photo</button>` : ""}
+          </div>` : `<div class="sub" style="margin-top:8px">📷 Enregistre d'abord le matériel pour pouvoir ajouter une photo.</div>`}
+
+        ${!isNew && t.code_qr ? `
+          <div class="card" style="text-align:center;margin-top:12px">
+            <div id="qr-preview" style="display:flex;justify-content:center;margin:6px 0"></div>
+            <div class="code">${esc(t.code_qr)}</div>
+            <button class="btn ghost block" onclick="location.hash='#/etiquettes/${tid}'">🖨️ Imprimer les étiquettes (choisir le nombre)</button>
+          </div>` : ""}
+
+        ${!isNew ? `<button class="btn ghost block" id="del-type" style="color:var(--danger);margin-top:16px">🗑 Supprimer ce matériel</button>` : ""}
+      </main>`;
+
+    // catégorie : afficher le champ "nouvelle" si choisi
+    $("#t-cat").onchange = (e) => {
+      $("#t-cat-new").style.display = e.target.value === "__new__" ? "block" : "none";
+    };
+
+    // tags : puces à bascule
+    const tagSet = new Set(t.tags || []);
+    $$("#t-tags .tagchip").forEach((b) => {
+      b.onclick = () => {
+        if (tagSet.has(b.dataset.tag)) tagSet.delete(b.dataset.tag);
+        else tagSet.add(b.dataset.tag);
+        b.style.cssText = chipCss(tagSet.has(b.dataset.tag));
+      };
+    });
+
+    // aperçu du QR
+    const prev = $("#qr-preview");
+    if (prev && t.code_qr) new QRCode(prev, { text: t.code_qr, width: 130, height: 130, correctLevel: QRCode.CorrectLevel.M });
+
+    $("#gen-code").onclick = () => { $("#t-code").value = slugCode($("#t-nom").value); };
+
+    // --- Photo du matériel (appareil photo ou galerie) ---
+    const photoCamBtn = $("#photo-cam-btn"), photoGalBtn = $("#photo-gal-btn");
+    const photoCam = $("#photo-cam"), photoGal = $("#photo-gal");
+    async function uploadPhoto(file) {
+      if (!file) return;
+      const btns = [photoCamBtn, photoGalBtn].filter(Boolean);
+      btns.forEach((b) => (b.disabled = true));
+      if (photoCamBtn) photoCamBtn.textContent = "⏳ Envoi de la photo…";
+      try {
+        const blob = await resizeImage(file);
+        const path = `${tid}/${Date.now()}.jpg`;
+        const up = await sb.storage.from("materiel-photos").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+        if (up.error) throw up.error;
+        const { data: pub } = sb.storage.from("materiel-photos").getPublicUrl(path);
+        const { error } = await sb.from("materiel_types").update({ photo_url: pub.publicUrl }).eq("id", tid);
+        if (error) throw error;
+        toast("Photo enregistrée ✔", "ok"); render();
+      } catch (e) {
+        btns.forEach((b) => (b.disabled = false));
+        if (photoCamBtn) photoCamBtn.textContent = "📷 Réessayer";
+        toast("Photo : " + (e.message || e), "err");
+      }
+    }
+    if (photoCamBtn && photoCam) {
+      photoCamBtn.onclick = () => photoCam.click();
+      photoCam.onchange = () => uploadPhoto(photoCam.files && photoCam.files[0]);
+    }
+    if (photoGalBtn && photoGal) {
+      photoGalBtn.onclick = () => photoGal.click();
+      photoGal.onchange = () => uploadPhoto(photoGal.files && photoGal.files[0]);
+    }
+    const photoDel = $("#photo-del");
+    if (photoDel) photoDel.onclick = async () => {
+      const { error } = await sb.from("materiel_types").update({ photo_url: null }).eq("id", tid);
+      toast(error ? error.message : "Photo retirée ✔", error ? "err" : "ok");
+      if (!error) render();
+    };
+
+    $("#save").onclick = async () => {
+      const nom = $("#t-nom").value.trim();
+      if (!nom) return toast("Ajoute un nom", "err");
+      let code = $("#t-code").value.trim();
+      if (!code) code = slugCode(nom);            // auto si vide
+      // catégorie : valeur choisie, ou nouvelle saisie
+      let categorie = $("#t-cat").value;
+      if (categorie === "__new__") {
+        categorie = $("#t-cat-new").value.trim();
+        if (categorie) await sb.from("materiel_categories").insert({ nom: categorie }).then(() => {}, () => {});
+      }
+      const parcInitial = parkLocked ? (t.stock_total || 0) : (parseInt($("#t-stock").value) || 0);
+      const payload = {
+        nom,
+        categorie: categorie || null,
+        prix_unitaire: parseFloat($("#t-prix").value) || 0,
+        stock_total: parcInitial,
+        code_qr: code || null,
+        tags: Array.from(tagSet),
+        dotation_fixe: parseInt($("#t-dotfixe").value) || 0,
+        dotation_pax: parseInt($("#t-dotpax").value) || 0,
+      };
+      $("#save").disabled = true;
+      let error, newId = tid;
+      if (isNew) {
+        const res = await sb.from("materiel_types").insert(payload).select().single();
+        error = res.error;
+        if (!error) newId = res.data.id;
+      } else {
+        error = (await sb.from("materiel_types").update(payload).eq("id", tid)).error;
+      }
+      if (error) {
+        $("#save").disabled = false;
+        return toast(error.message.includes("duplicate") || error.code === "23505"
+          ? "Ce code QR est déjà utilisé par un autre type" : error.message, "err");
+      }
+      // Première saisie du parc -> on l'inscrit au journal (motif "initial")
+      if (!parkLocked && parcInitial > 0) {
+        await sb.from("parc_journal").insert({
+          type_id: newId, delta: parcInitial, motif: "initial",
+          commentaire: "Saisie initiale du parc", par_user: state.user.id,
+        });
+      }
+      toast("Enregistré ✔", "ok");
+      if (isNew) return go("type/" + newId);
+      render();
+    };
+
+    // suppression (ou archivage si un historique existe)
+    const delBtn = $("#del-type");
+    if (delBtn) {
+      let armed = false;
+      delBtn.onclick = async () => {
+        if (!armed) {
+          armed = true;
+          delBtn.textContent = "Confirmer la suppression ?";
+          delBtn.classList.remove("ghost"); delBtn.classList.add("danger");
+          setTimeout(() => {
+            if (!armed) return;
+            armed = false;
+            delBtn.textContent = "🗑 Supprimer ce matériel";
+            delBtn.classList.add("ghost"); delBtn.classList.remove("danger");
+          }, 4000);
+          return;
+        }
+        delBtn.disabled = true;
+        const { error } = await sb.from("materiel_types").delete().eq("id", tid);
+        if (error) {
+          // référencé par des mouvements/facturations -> on archive au lieu de casser l'historique
+          const { error: e2 } = await sb.from("materiel_types").update({ actif: false }).eq("id", tid);
+          if (e2) { delBtn.disabled = false; return toast(e2.message, "err"); }
+          toast("Matériel archivé (un historique existe, données conservées)", "ok");
+        } else {
+          toast("Matériel supprimé ✔", "ok");
+        }
+        go("materiel");
+      };
+    }
+  }
+
+  // =========================================================================
+  //  VUE : Étiquettes QR imprimables
+  // =========================================================================
+  async function viewEtiquettes(tid) {
+    const t = await db.type(tid);
+    if (!t.code_qr) {
+      app.innerHTML = topbar("Étiquettes", { back: "type/" + tid }) +
+        `<main><div class="card">Ce type n'a pas encore de code QR. Reviens en arrière et clique « Auto » pour en générer un.</div></main>`;
+      return;
+    }
+    app.innerHTML =
+      topbar("Étiquettes · " + t.nom, { back: "type/" + tid, action: "🖨️ Imprimer" }) +
+      `<main>
+        <div class="card no-print">
+          <div class="sub">Toutes les étiquettes de « ${esc(t.nom)} » portent le même QR (<b>${esc(t.code_qr)}</b>).
+          Choisis combien d'exemplaires imprimer, puis colles-en une sur chaque caisse.</div>
+          <label>Nombre d'étiquettes</label>
+          <div class="field-row">
+            <input id="nb" type="number" value="10" min="1" max="200" />
+            <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
+          </div>
+          <div class="sub" style="margin-top:8px">💡 Étiquette <b>carrée 62 × 62 mm</b>. À l'impression, choisis l'imprimante Brother et le papier <b>« 62mm x 1m »</b> (rouleau continu), échelle <b>100 %</b> / « ajuster à la page » désactivé. Alternative : le CSV (écran Matériel) dans P-touch Editor pour un format sur mesure.</div>
+        </div>
+        <div class="labels" id="labels"></div>
+      </main>`;
+    $("#tb-action").onclick = () => window.print();
+
+    const render = () => {
+      const n = Math.min(200, Math.max(1, parseInt($("#nb").value) || 1));
+      const box = $("#labels");
+      box.innerHTML = "";
+      for (let i = 0; i < n; i++) {
+        const div = document.createElement("div");
+        div.className = "label";
+        const qr = document.createElement("div");
+        div.appendChild(qr);
+        div.insertAdjacentHTML("beforeend", `<div class="lib">${esc(t.nom)}</div><div class="code">${esc(t.code_qr)}</div>`);
+        box.appendChild(div);
+        new QRCode(qr, { text: t.code_qr, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
+      }
+    };
+    $("#apply").onclick = render;
+    render();
+  }
+
+  // =========================================================================
+  //  VUE : Étiquettes de préparation d'une prestation (QR + infos, 62 mm)
+  //  Accès : tous les comptes connectés (livreurs, préparateurs, admin).
+  // =========================================================================
+  async function viewPrestaLabels(id) {
+    const p = await db.prestation(id);
+    const cli = p.clients || {};
+    const lieu = p.lieu_livraison || cli.adresse_livraison || cli.adresse || "";
+    const bl = p.reference || p.ext_ref || "";
+    const url = location.origin + location.pathname + "#/prestation/" + id;
+    const plabelCss = `
+      <style>
+        .plabels{display:flex;flex-direction:column;align-items:center;gap:12px;margin-top:12px}
+        .plabel{width:62mm;box-sizing:border-box;border:1px dashed var(--line);border-radius:8px;
+          padding:3mm;display:flex;flex-direction:column;align-items:center;text-align:center;background:#fff;color:#111}
+        .plabel .pcli{font-weight:800;font-size:13px;line-height:1.15;margin-bottom:1mm}
+        .plabel .plieu{font-size:11px;line-height:1.2;margin-bottom:1mm}
+        .plabel .pmeta{font-size:11px;font-weight:700;margin-bottom:2mm}
+        .plabel canvas,.plabel img{width:34mm !important;height:34mm !important}
+        .plabel .pbl{font-family:monospace;font-size:10px;margin-top:1mm;word-break:break-all}
+        @media print{
+          .plabels{display:block;margin:0}
+          .plabel{width:62mm;border:0;border-radius:0;page-break-after:always;break-after:page;padding:3mm}
+          .plabel:last-child{page-break-after:auto}
+        }
+      </style>`;
+    app.innerHTML =
+      topbar("Étiquettes · " + (p.libelle || ""), { back: "prestation/" + id, action: "🖨️ Imprimer" }) +
+      plabelCss +
+      `<main>
+        <div class="card no-print">
+          <div class="sub">Étiquettes à coller sur les caisses de préparation. Chaque étiquette porte le lieu, la date, le n° de dossier et un <b>QR</b> qui ouvre la fiche prestation quand on le scanne.</div>
+          <label>Nombre d'étiquettes</label>
+          <div class="field-row">
+            <input id="nb" type="number" value="2" min="1" max="50" />
+            <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
+          </div>
+          <button class="btn block" id="btn-print" style="margin-top:10px">🖨️ Imprimer les étiquettes</button>
+          <button class="btn sec block" id="dl-png" style="margin-top:8px">📥 Enregistrer en image (dépannage)</button>
+          <div class="sub" style="margin-top:8px">Imprimante <b>Brother QL-810W</b>, rouleau continu <b>62 mm</b>. Au moment d'imprimer, choisis la Brother et le papier <b>« 62mm »</b>.<br>⚠️ Sur Android, le <b>service d'impression</b> doit être activé (Réglages → Impression). Si l'impression système refuse, utilise « Enregistrer en image » puis l'app <b>Brother iPrint&amp;Label</b>.</div>
+          ${!lieu ? `<div class="sub" style="margin-top:8px;color:var(--danger)">⚠️ Aucun lieu de livraison sur cette prestation. Ajoute-le via « Modifier » ou dans la fiche client.</div>` : ""}
+        </div>
+        <div class="plabels" id="plabels"></div>
+      </main>`;
+
+    // QR en image (data URL) : plus fiable à l'impression qu'un canvas vivant.
+    const qrDataURL = () => {
+      const tmp = document.createElement("div");
+      new QRCode(tmp, { text: url, width: 320, height: 320, correctLevel: QRCode.CorrectLevel.M });
+      const c = tmp.querySelector("canvas");
+      if (c) { try { return c.toDataURL("image/png"); } catch (e) {} }
+      const im = tmp.querySelector("img");
+      return im ? im.src : "";
+    };
+    // Impression DIRECTE (sans téléchargement) : on écrit les étiquettes dans une
+    // iframe isolée, avec une vraie page 62 mm, puis on ouvre la boîte d'impression.
+    const printLabels = () => {
+      const n = Math.min(50, Math.max(1, parseInt($("#nb").value) || 1));
+      const qr = qrDataURL();
+      const one =
+        `<div class="lbl">` +
+        `<div class="cli">${esc(cli.nom || p.libelle || "Prestation")}</div>` +
+        (lieu ? `<div class="lieu">${esc(lieu)}</div>` : "") +
+        `<div class="meta">${esc(dateStr)}${bl ? " · N° " + esc(bl) : ""}</div>` +
+        (qr ? `<img src="${qr}" alt="">` : "") +
+        (bl ? `<div class="bl">${esc(bl)}</div>` : "") +
+        `</div>`;
+      let body = ""; for (let i = 0; i < n; i++) body += one;
+      const doc =
+        `<!doctype html><html><head><meta charset="utf-8"><title>Étiquettes</title><style>` +
+        `@page{size:62mm auto;margin:0}` +
+        `*{box-sizing:border-box}html,body{margin:0;padding:0}` +
+        `body{font-family:system-ui,-apple-system,Arial,sans-serif;color:#000}` +
+        `.lbl{width:62mm;padding:3mm 2mm;text-align:center;page-break-after:always;break-after:page;display:flex;flex-direction:column;align-items:center;justify-content:flex-start}` +
+        `.lbl:last-child{page-break-after:auto;break-after:auto}` +
+        `.cli{font-weight:800;font-size:13px;line-height:1.15}` +
+        `.lieu{font-size:11px;line-height:1.2;margin:1mm 0}` +
+        `.meta{font-weight:700;font-size:11px;margin-bottom:2mm}` +
+        `.lbl img{width:34mm;height:34mm;display:block}` +
+        `.bl{font-family:monospace;font-size:10px;margin-top:1mm;word-break:break-all}` +
+        `</style></head><body>${body}</body></html>`;
+      const ifr = document.createElement("iframe");
+      ifr.setAttribute("aria-hidden", "true");
+      ifr.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
+      document.body.appendChild(ifr);
+      const d = ifr.contentWindow.document;
+      d.open(); d.write(doc); d.close();
+      const fire = () => {
+        try { ifr.contentWindow.focus(); ifr.contentWindow.print(); }
+        catch (e) { try { window.print(); } catch (_e) {} }
+        setTimeout(() => { try { document.body.removeChild(ifr); } catch (e) {} }, 8000);
+      };
+      setTimeout(fire, 500); // la data URL est déjà chargée : court délai suffisant
+    };
+    if ($("#tb-action")) $("#tb-action").onclick = printLabels;
+    if ($("#btn-print")) $("#btn-print").onclick = printLabels;
+
+    // Génère l'étiquette en image PNG (Canvas) — voie fiable sur mobile (app Brother),
+    // indépendante du service d'impression Android qui « perd » l'imprimante.
+    const wrapText = (ctx, text, maxW) => {
+      const words = String(text).split(/\s+/), lines = []; let line = "";
+      words.forEach((w) => {
+        const t = line ? line + " " + w : w;
+        if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = w; } else line = t;
+      });
+      if (line) lines.push(line);
+      return lines;
+    };
+    const downloadLabelPNG = () => {
+      const S = 10, W = 62 * S, padX = 26, padY = 26, maxW = W - padX * 2, qrSize = 360;
+      const tmp = document.createElement("div");
+      new QRCode(tmp, { text: url, width: qrSize, height: qrSize, correctLevel: QRCode.CorrectLevel.M });
+      const qrEl = tmp.querySelector("canvas") || tmp.querySelector("img");
+      const mctx = document.createElement("canvas").getContext("2d");
+      mctx.font = "700 32px system-ui,Arial"; const cliLines = wrapText(mctx, cli.nom || p.libelle || "Prestation", maxW);
+      mctx.font = "24px system-ui,Arial"; const lieuLines = lieu ? wrapText(mctx, lieu, maxW) : [];
+      let h = padY + cliLines.length * 38 + 6 + lieuLines.length * 30 + 6 + 36 + 14 + qrSize + 16 + (bl ? 26 : 0) + padY;
+      const cv = document.createElement("canvas"); cv.width = W; cv.height = Math.round(h);
+      const ctx = cv.getContext("2d");
+      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, cv.height);
+      ctx.fillStyle = "#111"; ctx.textAlign = "center";
+      const finish = () => {
+        let y = padY + 32;
+        ctx.font = "700 32px system-ui,Arial"; cliLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 38; });
+        y += 6; ctx.font = "24px system-ui,Arial"; ctx.fillStyle = "#333"; lieuLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 30; });
+        y += 4; ctx.fillStyle = "#111"; ctx.font = "700 24px system-ui,Arial";
+        ctx.fillText(dateStr + (bl ? " · N° " + bl : ""), W / 2, y); y += 30;
+        if (qrEl) { try { ctx.drawImage(qrEl, (W - qrSize) / 2, y, qrSize, qrSize); } catch (e) {} y += qrSize + 20; }
+        if (bl) { ctx.font = "18px monospace"; ctx.fillStyle = "#444"; ctx.fillText(bl, W / 2, y); }
+        const data = cv.toDataURL("image/png");
+        const a = document.createElement("a");
+        a.href = data; a.download = "etiquette-" + String(bl || id).replace(/[^\w-]+/g, "_") + ".png";
+        document.body.appendChild(a); a.click(); a.remove();
+      };
+      if (qrEl && qrEl.tagName === "IMG" && !qrEl.complete) qrEl.onload = finish; else finish();
+    };
+    $("#dl-png").onclick = downloadLabelPNG;
+
+    const dateStr = dfr(p.date_presta);
+    const draw = () => {
+      const n = Math.min(50, Math.max(1, parseInt($("#nb").value) || 1));
+      const box = $("#plabels"); box.innerHTML = "";
+      for (let i = 0; i < n; i++) {
+        const div = document.createElement("div");
+        div.className = "plabel";
+        div.insertAdjacentHTML("beforeend",
+          `<div class="pcli">${esc(cli.nom || p.libelle || "Prestation")}</div>` +
+          (lieu ? `<div class="plieu">📍 ${esc(lieu)}</div>` : "") +
+          `<div class="pmeta">${esc(dateStr)}${bl ? " · N° " + esc(bl) : ""}</div>`);
+        const qr = document.createElement("div");
+        div.appendChild(qr);
+        if (bl) div.insertAdjacentHTML("beforeend", `<div class="pbl">${esc(bl)}</div>`);
+        box.appendChild(div);
+        new QRCode(qr, { text: url, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
+      }
+    };
+    $("#apply").onclick = draw;
+    draw();
+  }
+
+  // =========================================================================
+  //  VUE : Scanner un QR de prestation -> ouvre la fiche
+  // =========================================================================
+  async function viewScan() {
+    app.innerHTML =
+      topbar("Scanner une prestation", { back: "prestations" }) +
+      `<main>
+        <div class="card"><div class="sub">Vise le <b>QR d'une étiquette de prestation</b> pour ouvrir sa fiche directement.</div></div>
+        <div id="scanner-box"></div>
+        <div id="scan-hint" class="sub" style="text-align:center;margin-top:8px">Initialisation de la caméra…</div>
+      </main>`;
+    startScanner((decoded) => {
+      const m = String(decoded).match(/prestation\/([0-9a-fA-F-]{36})/);
+      if (m) { stopScanner(); go("prestation/" + m[1]); return; }
+      const hint = $("#scan-hint");
+      if (hint) hint.textContent = "QR non reconnu comme prestation. Réessaie.";
+    });
+  }
+
+  // =========================================================================
+  //  Emails (récap) — via le client mail (mailto)
+  // =========================================================================
+  function openMail(to, subject, body) {
+    const url = "mailto:" + encodeURIComponent(to || "") +
+      "?subject=" + encodeURIComponent(subject) +
+      "&body=" + encodeURIComponent(body);
+    window.location.href = url;
+  }
+
+  // =========================================================================
+  //  Commentaire livreur -> logistique (via edge function Brevo)
+  // =========================================================================
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).split(",")[1] || ""); // enlève le préfixe data:
+      r.onerror = () => reject(new Error("lecture image échouée"));
+      r.readAsDataURL(blob);
+    });
+  }
+
+  // Carte HTML réutilisable : texte + photo optionnelle
+  function commentCardHtml(placeholderCtx) {
+    const ph = placeholderCtx === "récupération"
+      ? "Un mot pour la logistique (matériel non rendu, souci au débarrassage, retard…)"
+      : "Un mot pour la logistique (accès, contact sur place, matériel, retard…)";
+    return `<div class="card" id="cm-card">
+      <textarea id="cm-text" placeholder="${esc(ph)}"></textarea>
+      <input id="cm-photo" type="file" accept="image/*" capture="environment" style="display:none" />
+      <input id="cm-photo-gal" type="file" accept="image/*" style="display:none" />
+      <div id="cm-photo-name" class="sub" style="margin-top:4px"></div>
+      <div class="btn-grid" style="margin-top:8px">
+        <button type="button" class="btn sec" id="cm-photo-btn">📷 Photo</button>
+        <button type="button" class="btn sec" id="cm-photo-gal-btn">🖼️ Galerie</button>
+      </div>
+      <button type="button" class="btn block" id="cm-send" style="margin-top:8px">✉️ Envoyer à la logistique</button>
+    </div>`;
+  }
+
+  // Branche les boutons de la carte commentaire (photo + envoi)
+  function wireCommentCard(p, etape) {
+    const camIn = $("#cm-photo"), galIn = $("#cm-photo-gal");
+    const nameEl = $("#cm-photo-name");
+    let photoBlob = null;
+    const pick = async (input) => {
+      const f = input.files && input.files[0];
+      if (!f) return;
+      try {
+        photoBlob = await resizeImage(f, 1400, 0.8);
+        if (nameEl) nameEl.textContent = "📎 Photo jointe (" + Math.round(photoBlob.size / 1024) + " Ko) — appuie sur Envoyer";
+      } catch (e) { toast("Photo illisible", "err"); }
+    };
+    if ($("#cm-photo-btn")) $("#cm-photo-btn").onclick = () => camIn.click();
+    if ($("#cm-photo-gal-btn")) $("#cm-photo-gal-btn").onclick = () => galIn.click();
+    camIn.onchange = () => pick(camIn);
+    galIn.onchange = () => pick(galIn);
+
+    $("#cm-send").onclick = async () => {
+      const text = $("#cm-text").value.trim();
+      if (!text && !photoBlob) return toast("Écris un commentaire ou joins une photo", "err");
+      const btn = $("#cm-send");
+      btn.disabled = true; btn.textContent = "⏳ Envoi…";
+      try {
+        let photo_base64 = null;
+        if (photoBlob) photo_base64 = await blobToBase64(photoBlob);
+        const { data: sess } = await sb.auth.getSession();
+        const token = sess && sess.session ? sess.session.access_token : "";
+        const res = await fetch(CFG.SUPABASE_URL + "/functions/v1/send-comment", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + token,
+            "apikey": CFG.SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            prestation_id: p.id,
+            prestation_lib: p.libelle || p.reference || "Prestation",
+            client_nom: p.clients ? p.clients.nom : "",
+            date_presta: p.date_presta || "",
+            livreur_nom: (state.profile && state.profile.nom) || state.user.email,
+            livreur_email: state.user.email,
+            etape,
+            commentaire: text,
+            photo_base64,
+          }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok || out.error) throw new Error(out.error || ("HTTP " + res.status));
+        toast("Commentaire envoyé à la logistique ✔", "ok");
+        $("#cm-text").value = ""; photoBlob = null;
+        if (nameEl) nameEl.textContent = "";
+        btn.disabled = false; btn.textContent = "✉️ Envoyer à la logistique";
+      } catch (e) {
+        btn.disabled = false; btn.textContent = "✉️ Réessayer l'envoi";
+        toast("Envoi impossible : " + (e.message || e), "err");
+      }
+    };
+  }
+
+  // =========================================================================
+  //  Preuve de livraison Consignerie : photo archivée dans GreenLoop
+  //  + ouverture de la page Consignerie (lien du QR), sans re-scanner.
+  // =========================================================================
+  const isConsigUrl = (u) => /consignerie\.com\/bl\//i.test(u || "");
+  function consignerieCardHtml(p) {
+    const has = isConsigUrl(p.consignerie_url);
+    const photo = p.preuve_photo_url;
+    return `<div class="card" id="cons-card">
+      <div class="sub" style="font-weight:700;margin-bottom:6px">📸 Preuve de livraison Consignerie</div>
+      ${has ? `
+        <div id="cons-photo-wrap">${photo ? `<img src="${esc(photo)}" alt="preuve" style="width:100%;border-radius:10px;display:block;margin-bottom:8px" />` : ""}</div>
+        <input id="cons-cam" type="file" accept="image/*" capture="environment" style="display:none" />
+        <div class="btn-grid">
+          <button type="button" class="btn sec" id="cons-photo-btn">📷 ${photo ? "Reprendre la photo" : "Prendre la photo"}</button>
+          <button type="button" class="btn" id="cons-open">➡️ Ouvrir la preuve Consignerie</button>
+        </div>
+        <div class="sub" style="margin-top:6px">La photo est archivée ici. Ouvre ensuite la page Consignerie et dépose la même photo (elle est dans ta galerie).</div>
+        <button type="button" class="btn ghost sm" id="cons-unlink" style="margin-top:8px;color:var(--muted)">Délier ce bon</button>
+      ` : `
+        <div class="sub" style="margin-bottom:6px">Aucun bon Consignerie lié. Scanne le QR du BL une fois (ou colle le lien) : ensuite les livreurs n'auront plus à scanner.</div>
+        <div id="cons-scan" class="hidden"><div id="cons-scanbox" style="border-radius:10px;overflow:hidden;margin-bottom:8px;background:#000"></div></div>
+        <button type="button" class="btn sec block" id="cons-scan-btn">🔗 Scanner le QR du BL</button>
+        <div class="field-row" style="margin-top:8px">
+          <input id="cons-url" placeholder="…ou coller https://app.consignerie.com/bl/…" />
+          <button type="button" class="btn sm sec" id="cons-url-save" style="flex:0 0 auto">OK</button>
+        </div>
+      `}
+    </div>`;
+  }
+  function wireConsignerieCard(p) {
+    const saveUrl = async (url) => {
+      if (!isConsigUrl(url)) { toast("Lien Consignerie invalide (doit contenir consignerie.com/bl/…)", "err"); return false; }
+      const { error } = await sb.from("prestations").update({ consignerie_url: url.trim() }).eq("id", p.id);
+      if (error) { toast(error.message, "err"); return false; }
+      toast("Bon Consignerie lié ✔", "ok"); render(); return true;
+    };
+    const openBtn = $("#cons-open");
+    if (openBtn) openBtn.onclick = () => window.open(p.consignerie_url, "_blank");
+
+    const unlink = $("#cons-unlink");
+    if (unlink) unlink.onclick = async () => {
+      const { error } = await sb.from("prestations").update({ consignerie_url: null }).eq("id", p.id);
+      toast(error ? error.message : "Bon délié ✔", error ? "err" : "ok");
+      if (!error) render();
+    };
+
+    // Prise + archivage de la photo de preuve (bucket materiel-photos, préfixe preuves/)
+    const camBtn = $("#cons-photo-btn"), cam = $("#cons-cam");
+    if (camBtn && cam) {
+      camBtn.onclick = () => cam.click();
+      cam.onchange = async () => {
+        const f = cam.files && cam.files[0];
+        if (!f) return;
+        camBtn.disabled = true; camBtn.textContent = "⏳ Envoi…";
+        try {
+          const blob = await resizeImage(f, 1400, 0.8);
+          const path = `preuves/${p.id}/${Date.now()}.jpg`;
+          const up = await sb.storage.from("materiel-photos").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+          if (up.error) throw up.error;
+          const { data: pub } = sb.storage.from("materiel-photos").getPublicUrl(path);
+          const { error } = await sb.from("prestations").update({ preuve_photo_url: pub.publicUrl }).eq("id", p.id);
+          if (error) throw error;
+          toast("Photo archivée ✔ — ouvre la page Consignerie pour la déposer", "ok");
+          render();
+        } catch (e) {
+          camBtn.disabled = false; camBtn.textContent = "📷 Réessayer";
+          toast("Photo : " + (e.message || e), "err");
+        }
+      };
+    }
+
+    // Coller le lien
+    const urlSave = $("#cons-url-save");
+    if (urlSave) urlSave.onclick = () => saveUrl($("#cons-url").value);
+
+    // Scanner le QR une fois (scanner local, indépendant du scanner de sortie)
+    const scanBtn = $("#cons-scan-btn");
+    if (scanBtn) {
+      let scanner = null;
+      scanBtn.onclick = async () => {
+        const box = $("#cons-scan");
+        if (scanner) { try { await scanner.stop(); scanner.clear(); } catch (e) {} scanner = null; box.classList.add("hidden"); scanBtn.textContent = "🔗 Scanner le QR du BL"; return; }
+        box.classList.remove("hidden");
+        scanBtn.textContent = "✕ Arrêter le scan";
+        try {
+          scanner = new Html5Qrcode("cons-scanbox", { verbose: false });
+          let done = false;
+          await scanner.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 220, height: 220 } },
+            async (decoded) => {
+              if (done) return;
+              if (!isConsigUrl(decoded)) return; // ignore les autres QR
+              done = true;
+              try { await scanner.stop(); scanner.clear(); } catch (e) {}
+              scanner = null;
+              saveUrl(decoded);
+            }, () => {});
+        } catch (e) {
+          box.innerHTML = `<div style="padding:16px;color:#fff;text-align:center;font-size:13px">📷 Caméra indisponible — colle le lien ci-dessous.</div>`;
+        }
+      };
+    }
+  }
+
+  const clientBadge = (t) =>
+    t === "fixe" ? '<span class="badge blue">Fixe</span>' : '<span class="badge gray">Ponctuel</span>';
+
+  // =========================================================================
+  //  VUE : Clients (annuaire)
+  // =========================================================================
+  async function viewClients() {
+    const clients = await db.clients();
+    const nFixe = clients.filter((c) => c.type_client === "fixe").length;
+    const nPonc = clients.filter((c) => c.type_client === "ponctuel").length;
+    const cats = [...new Set(clients.map((c) => c.categorie).filter(Boolean))].sort();
+    const card = (c) => `
+      <div class="card tap" onclick="location.hash='#/client/${c.id}'">
+        <div class="grow">
+          <div class="row between"><h3 class="truncate">${esc(c.nom)}</h3>${clientBadge(c.type_client)}</div>
+          <div class="sub">${esc(c.adresse_livraison || c.adresse || "")}${c.contact ? " · " + esc(c.contact) : ""}</div>
+          ${c.categorie ? `<div class="sub">🏷️ ${esc(c.categorie)}${c.groupe ? " · " + esc(c.groupe) : ""}</div>` : ""}
+        </div>
+        <div style="font-size:22px;color:#cbd5c9">›</div>
+      </div>`;
+
+    app.innerHTML =
+      topbar("Clients") +
+      `<main>
+        <div class="seg" id="filter">
+          <button data-f="tous" class="active">Tous (${clients.length})</button>
+          <button data-f="fixe">Fixes (${nFixe})</button>
+          <button data-f="ponctuel">Ponctuels (${nPonc})</button>
+        </div>
+        ${cats.length ? `<select id="catfilter" style="margin-bottom:10px">
+          <option value="">Toutes les catégories</option>
+          ${cats.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+        </select>` : ""}
+        <input id="search" placeholder="🔍 Rechercher (nom, catégorie, groupe…)" style="margin-bottom:10px" />
+        <div id="clist"></div>
+      </main>
+      <button class="fab" onclick="location.hash='#/client/new'">＋</button>`;
+
+    let f = "tous", q = "", cat = "";
+    const draw = () => {
+      let list = clients;
+      if (f !== "tous") list = list.filter((c) => c.type_client === f);
+      if (cat) list = list.filter((c) => c.categorie === cat);
+      if (q) list = list.filter((c) =>
+        [c.nom, c.categorie, c.groupe, c.contact].some((v) => (v || "").toLowerCase().includes(q)));
+      // regroupe par "groupe" quand une catégorie est sélectionnée
+      let html;
+      if (cat) {
+        const byG = {};
+        list.forEach((c) => ((byG[c.groupe || "—"] ||= []).push(c)));
+        html = Object.keys(byG).sort().map((g) =>
+          `<div class="section-title">${esc(g)}</div>${byG[g].map(card).join("")}`).join("");
+      } else {
+        html = list.map(card).join("");
+      }
+      $("#clist").innerHTML = list.length ? html
+        : '<div class="empty"><div class="big">🏢</div>Aucun client.</div>';
+    };
+    $("#filter").addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      f = b.dataset.f;
+      $$("#filter button").forEach((x) => x.classList.toggle("active", x === b));
+      draw();
+    });
+    const cf = $("#catfilter");
+    if (cf) cf.addEventListener("change", (e) => { cat = e.target.value; draw(); });
+    $("#search").addEventListener("input", (e) => { q = e.target.value.trim().toLowerCase(); draw(); });
+    draw();
+  }
+
+  // =========================================================================
+  //  VUE : Fiche client (solde détenu + récap + facturation)
+  // =========================================================================
+  async function viewClientDetail(id) {
+    const c = await db.client(id);
+    const solde = await db.soldeClient(id);
+    const totalPieces = solde.reduce((s, x) => s + x.solde, 0);
+    const totalValeur = solde.reduce((s, x) => s + x.solde * Number(x.prix_unitaire), 0);
+    const fixe = c.type_client === "fixe";
+
+    app.innerHTML =
+      topbar(c.nom, { back: "clients", action: "Modifier" }) +
+      `<main>
+        <div class="card">
+          <div class="row between">
+            <div class="grow">
+              ${c.categorie ? `<div class="sub">🏷️ ${esc(c.categorie)}${c.groupe ? " · " + esc(c.groupe) : ""}</div>` : ""}
+              ${c.titulaire ? `<div class="sub">📄 Titulaire du contrat : <b>${esc(c.titulaire)}</b></div>` : ""}
+              ${c.adresse ? `<div class="sub">📍 ${esc(c.adresse)}</div>` : ""}
+              ${c.adresse_livraison ? `<div class="sub">🚚 Livraison : ${esc(c.adresse_livraison)}</div>` : ""}
+              ${c.contact_livraison ? `<div class="sub">📞 Contact livraison : ${esc(c.contact_livraison)}</div>` : ""}
+              ${c.acces ? `<div class="sub">🔑 Accès : ${esc(c.acces)}</div>` : ""}
+              <div class="sub">${c.contact ? esc(c.contact) : ""}${c.email ? " · " + esc(c.email) : ""}${c.telephone ? " · " + esc(c.telephone) : ""}</div>
+            </div>
+            ${clientBadge(c.type_client)}
+          </div>
+        </div>
+
+        <div class="section-title">Matériel détenu à l'instant T</div>
+        ${solde.length === 0
+          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Ce client ne détient aucun matériel.</div>`
+          : `<div class="card">
+              ${solde.map((x) => `
+                <div class="mat-line">
+                  <div class="name"><b>${esc(x.type_nom)}</b><small>${esc(x.categorie || "")} · ${eur(x.prix_unitaire)} HT/u</small></div>
+                  <span class="badge ${x.solde > 0 ? "amber" : "green"}">${x.solde}</span>
+                </div>`).join("")}
+              <div class="divider"></div>
+              <div class="row between"><b>${totalPieces} pièce(s)</b><b>${eur(totalValeur)} HT</b></div>
+            </div>`}
+
+        ${solde.length ? `
+          <button class="btn sec block" id="retard">📦 Enregistrer un retour tardif</button>
+          <button class="btn block" id="recap">✉️ ${fixe ? "Envoyer le récap au client" : "Envoyer les manquants à la compta"}</button>
+          <button class="btn warn block" id="facturer">💶 Facturer ce matériel (perte/casse)</button>
+        ` : ""}
+
+        <div class="section-title">Prestations</div>
+        <div class="card" id="prestas"><div class="sub">Chargement…</div></div>
+
+        <div class="btn-grid" style="margin-top:16px">
+          <button class="btn sec" id="edit">✏️ Modifier</button>
+          <button class="btn ghost" id="del" style="color:var(--danger)">🗑 Supprimer</button>
+        </div>
+      </main>`;
+
+    $("#tb-action").onclick = () => go("client/" + id + "/edit");
+    $("#edit").onclick = () => go("client/" + id + "/edit");
+    const retardBtn = $("#retard");
+    if (retardBtn) retardBtn.onclick = () => go("client/" + id + "/retard");
+
+    // suppression en deux temps (pas de pop-up bloquant)
+    let armed = false;
+    const delBtn = $("#del");
+    delBtn.onclick = async () => {
+      if (!armed) {
+        armed = true;
+        delBtn.textContent = "Confirmer la suppression ?";
+        delBtn.classList.remove("ghost");
+        delBtn.classList.add("danger");
+        setTimeout(() => {
+          if (!armed) return;
+          armed = false;
+          delBtn.textContent = "🗑 Supprimer";
+          delBtn.classList.add("ghost");
+          delBtn.classList.remove("danger");
+        }, 4000);
+        return;
+      }
+      delBtn.disabled = true;
+      const { error } = await sb.from("clients").delete().eq("id", id);
+      if (error) { delBtn.disabled = false; return toast(error.message, "err"); }
+      toast("Client supprimé ✔", "ok");
+      go("clients");
+    };
+
+    // liste des prestations du client
+    const prestas = await db.prestationsByClient(id);
+    $("#prestas").innerHTML = prestas.length
+      ? prestas.map((p) => `<div class="mat-line">
+          <div class="name" onclick="location.hash='#/prestation/${p.id}'" style="cursor:pointer;flex:1"><b>${esc(p.libelle || "Prestation")}</b><small>${dfr(p.date_presta)} · ${esc(STATUT_LABEL[p.statut] || "")}</small></div>
+          <button class="btn sm ghost" onclick="location.hash='#/prestation/${p.id}/manquants'" style="padding:6px 10px;flex:0 0 auto">📊 Manquants</button>
+        </div>`).join("")
+      : '<div class="sub">Aucune prestation.</div>';
+
+    // récap par email
+    const recapBtn = $("#recap");
+    if (recapBtn) recapBtn.onclick = async () => {
+      const lignes = solde.map((x) => `- ${x.type_nom} : ${x.solde}`).join("\n");
+      if (fixe) {
+        if (!c.email) return toast("Ce client n'a pas d'email — ajoute-le via Modifier", "err");
+        const body =
+`Bonjour,
+
+Voici le récapitulatif du matériel BRIFFE actuellement en votre possession :
+
+${lignes}
+
+Total : ${totalPieces} pièce(s), valeur de remplacement ${eur(totalValeur)} HT.
+
+Merci de nous signaler tout élément manquant, cassé ou perdu afin de régulariser.
+
+Bien cordialement,
+L'équipe BRIFFE`;
+        openMail(c.email, `Récapitulatif matériel BRIFFE — ${c.nom}`, body);
+      } else {
+        const compta = await db.param("email_compta");
+        if (!compta) return toast("Renseigne l'email de la compta dans Paramètres", "err");
+        const body =
+`Matériel non restitué par le client ${c.nom} :
+
+${lignes}
+
+Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
+        openMail(compta, `Matériel à facturer — ${c.nom}`, body);
+      }
+    };
+
+    // facturation (niveau client)
+    const factBtn = $("#facturer");
+    if (factBtn) factBtn.onclick = async () => {
+      factBtn.disabled = true;
+      const rows = solde.filter((x) => x.solde > 0).map((x) => ({
+        client_id: id, prestation_id: null, type_id: x.type_id,
+        motif: "perte", quantite: x.solde, prix_unitaire: x.prix_unitaire, statut: "a_facturer",
+      }));
+      if (!rows.length) { factBtn.disabled = false; return toast("Rien à facturer", "err"); }
+      const { error } = await sb.from("facturations").insert(rows);
+      factBtn.disabled = false;
+      toast(error ? error.message : `${rows.length} ligne(s) ajoutée(s) à facturer ✔`, error ? "err" : "ok");
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Retour tardif — matériel rendu après coup, diminue le solde détenu
+  //  sans toucher au statut des prestations ni à la facturation.
+  // =========================================================================
+  async function viewRetardClient(id) {
+    const c = await db.client(id);
+    const solde = (await db.soldeClient(id)).filter((x) => x.solde > 0).sort((a, b) => b.solde - a.solde);
+
+    app.innerHTML =
+      topbar("Retour tardif · " + c.nom, { back: "client/" + id }) +
+      `<main>
+        ${solde.length === 0
+          ? `<div class="card" style="text-align:center"><div style="font-size:30px">✅</div>Ce client ne détient plus aucun matériel.</div>`
+          : `<div class="sub" style="margin-bottom:10px">Le client rend du matériel qui n'avait pas été repris lors d'une précédente livraison. Indique les quantités rendues : le <b>matériel détenu</b> diminue d'autant, sans changer le statut des prestations ni la facturation.</div>
+             ${solde.map((x) => `
+               <div class="card" data-ret="${x.type_id}" data-max="${x.solde}" data-nom="${esc(x.type_nom)}">
+                 <div class="row between"><b>${esc(x.type_nom)}</b><span class="badge amber">détenu ${x.solde}</span></div>
+                 <div class="field-row" style="margin-top:8px">
+                   <div><label style="margin-top:0">Rendu maintenant</label><input class="ret-in" type="number" inputmode="numeric" value="0" min="0" max="${x.solde}" /></div>
+                   <div style="display:flex;align-items:flex-end"><button type="button" class="btn sm sec ret-all" style="width:100%">Tout (${x.solde})</button></div>
+                 </div>
+               </div>`).join("")}
+             <div class="card" style="position:sticky;bottom:calc(84px + var(--safe-b))">
+               <div class="row between" style="margin-bottom:8px"><b id="ret-recap">0 pièce(s) à enregistrer</b></div>
+               <button class="btn block" id="ret-save">Enregistrer le retour</button>
+             </div>`}
+      </main>`;
+
+    if (!solde.length) return;
+
+    const cards = () => $$("[data-ret]");
+    const clamp = (el) => Math.max(0, Math.min(parseInt(el.dataset.max), parseInt(el.querySelector(".ret-in").value) || 0));
+    const refresh = () => {
+      let n = 0;
+      cards().forEach((el) => (n += clamp(el)));
+      $("#ret-recap").textContent = `${n} pièce(s) à enregistrer`;
+    };
+    app.querySelector("main").addEventListener("input", (e) => {
+      if (!e.target.classList.contains("ret-in")) return;
+      const el = e.target.closest("[data-ret]");
+      const max = parseInt(el.dataset.max);
+      let v = Math.max(0, Math.min(max, parseInt(e.target.value) || 0));
+      e.target.value = v;
+      refresh();
+    });
+    $$(".ret-all").forEach((b) => b.onclick = () => {
+      const el = b.closest("[data-ret]");
+      el.querySelector(".ret-in").value = el.dataset.max;
+      refresh();
+    });
+    refresh();
+
+    $("#ret-save").onclick = async () => {
+      const wanted = {};
+      cards().forEach((el) => { const v = clamp(el); if (v > 0) wanted[el.dataset.ret] = v; });
+      const typeIds = Object.keys(wanted);
+      if (!typeIds.length) return toast("Indique au moins une quantité rendue", "err");
+      $("#ret-save").disabled = true;
+
+      // Impute les retours sur les prestations du client qui ont encore du manquant,
+      // des plus anciennes aux plus récentes (FIFO) — sans toucher statut/facturation.
+      const prestas = (await db.prestationsByClient(id)).slice()
+        .sort((a, b) => (a.date_presta || "") < (b.date_presta || "") ? -1 : (a.date_presta || "") > (b.date_presta || "") ? 1 : 0);
+      const bilans = await Promise.all(prestas.map((p) => db.bilan(p.id)));
+      const mvts = [];
+      typeIds.forEach((tid) => {
+        let rem = wanted[tid];
+        for (let i = 0; i < prestas.length && rem > 0; i++) {
+          const b = (bilans[i] || []).find((x) => x.type_id === tid);
+          const out = b ? b.q_manquant : 0;
+          if (out > 0) {
+            const take = Math.min(out, rem);
+            mvts.push({ prestation_id: prestas[i].id, sens: "retour", type_id: tid, unit_id: null, quantite: take, par_user: state.user.id });
+            rem -= take;
+          }
+        }
+      });
+      if (!mvts.length) { $("#ret-save").disabled = false; return toast("Rien à imputer — le solde est déjà à jour.", "err"); }
+      const { error } = await sb.from("mouvements").insert(mvts);
+      $("#ret-save").disabled = false;
+      if (error) return toast(error.message, "err");
+      toast("Retour tardif enregistré ✔", "ok");
+      go("client/" + id);
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Créer / modifier un client
+  // =========================================================================
+  async function viewClientForm(id) {
+    const isNew = id === "new";
+    let c = { nom: "", type_client: "ponctuel", adresse: "", contact: "", email: "", telephone: "", sextan_id: "" };
+    if (!isNew) c = await db.client(id);
+    app.innerHTML =
+      topbar(isNew ? "Nouveau client" : "Modifier — " + c.nom, { back: isNew ? "clients" : "client/" + id }) +
+      `<main>
+        <div class="card">
+          <label>Nom</label><input id="c-nom" value="${esc(c.nom)}" placeholder="Nom du client" />
+          <label>Type de client</label>
+          <select id="c-type">
+            <option value="ponctuel" ${c.type_client === "ponctuel" ? "selected" : ""}>Ponctuel (tout revient au débarrassage)</option>
+            <option value="fixe" ${c.type_client === "fixe" ? "selected" : ""}>Fixe (garde du matériel d'une fois sur l'autre)</option>
+          </select>
+          <label>Adresse (siège / facturation)</label><input id="c-adr" value="${esc(c.adresse || "")}" placeholder="Adresse principale" />
+          <label>Adresse de livraison</label><input id="c-adrliv" value="${esc(c.adresse_livraison || "")}" placeholder="Si différente de l'adresse principale" />
+          <label>Contact livraison</label><input id="c-contactliv" value="${esc(c.contact_livraison || "")}" placeholder="Nom + tél de la personne sur place" />
+          <label>Accès</label><input id="c-acces" value="${esc(c.acces || "")}" placeholder="Digicode, étage, quai, consignes…" />
+          <label>Contact</label><input id="c-contact" value="${esc(c.contact || "")}" placeholder="Personne / service" />
+          <div class="field-row">
+            <div><label>Email</label><input id="c-email" type="email" value="${esc(c.email || "")}" placeholder="pour le récap" /></div>
+            <div><label>Téléphone</label><input id="c-tel" value="${esc(c.telephone || "")}" /></div>
+          </div>
+          <div class="field-row">
+            <div><label>Catégorie</label><input id="c-cat" list="cat-list" value="${esc(c.categorie || "")}" placeholder="ex. Appels d'offre" /></div>
+            <div><label>Groupe</label><input id="c-groupe" value="${esc(c.groupe || "")}" placeholder="ex. UnivLille" /></div>
+          </div>
+          <label>Titulaire du contrat (appel d'offre)</label>
+          <input id="c-titulaire" list="titulaire-list" value="${esc(c.titulaire || "")}" placeholder="Qui détient le contrat : Briffe, La consignerie…" />
+          <datalist id="titulaire-list"><option value="Briffe"></option><option value="La consignerie"></option></datalist>
+          <datalist id="cat-list"></datalist>
+          <label>ID Sextan (optionnel)</label><input id="c-sextan" value="${esc(c.sextan_id || "")}" />
+          <label style="display:flex;align-items:center;gap:8px;margin-top:12px">
+            <input type="checkbox" id="c-syncexcl" ${c.sync_exclure ? "checked" : ""} style="width:20px;height:20px" />
+            Exclure de la synchro Sextan
+          </label>
+          <div class="sub" style="margin-top:2px">Coché : les événements Sextan de ce client ne sont PAS importés (ex. La consignerie, dont les appels d'offre passent par briffetools).</div>
+          <button class="btn block" id="save" style="margin-top:12px">${isNew ? "Créer" : "Enregistrer"}</button>
+        </div>
+        ${isNew ? `<div class="card"><div class="sub">💡 Enregistre d'abord le client : tu pourras ensuite ajouter plusieurs adresses de livraison.</div></div>`
+          : `<div class="card">
+              <div class="section-title" style="margin-top:0">Adresses de livraison</div>
+              <div class="sub" style="margin-bottom:8px">Plusieurs lieux possibles pour ce client. Elles alimentent le choix du lieu sur chaque prestation et les étiquettes.</div>
+              <div id="adr-list"></div>
+              <div class="field-row" style="margin-top:8px">
+                <div><label style="margin-top:0">Libellé</label><input id="adr-lib" placeholder="ex. Site EuraTech" /></div>
+                <div style="flex:2"><label style="margin-top:0">Adresse</label><input id="adr-txt" placeholder="Adresse complète de livraison" /></div>
+              </div>
+              <button class="btn sec block" id="adr-add" style="margin-top:8px">➕ Ajouter cette adresse</button>
+            </div>`}
+      </main>`;
+
+    // suggestions de catégories déjà utilisées
+    db.clients().then((all) => {
+      const cats = [...new Set(all.map((x) => x.categorie).filter(Boolean))].sort();
+      const dl = $("#cat-list");
+      if (dl) dl.innerHTML = cats.map((c) => `<option value="${esc(c)}"></option>`).join("");
+    }).catch(() => {});
+
+    // Adresses de livraison multiples (client existant)
+    if (!isNew) {
+      const drawAdr = async () => {
+        const box = $("#adr-list"); if (!box) return;
+        const { data } = await sb.from("client_adresses").select("*").eq("client_id", id).order("created_at");
+        const list = data || [];
+        box.innerHTML = list.length
+          ? list.map((a) => `<div class="row between" style="gap:8px;padding:7px 0;border-bottom:1px solid var(--line)">
+              <div class="grow"><b>${esc(a.libelle || "Adresse")}</b><div class="sub">${esc(a.adresse || "")}</div></div>
+              <button class="btn sm danger" data-adrdel="${a.id}" style="flex:0 0 auto">✕</button>
+            </div>`).join("")
+          : `<div class="sub">Aucune adresse enregistrée pour l'instant.</div>`;
+        box.querySelectorAll("[data-adrdel]").forEach((b) => b.onclick = async () => {
+          b.disabled = true;
+          const { error } = await sb.from("client_adresses").delete().eq("id", b.dataset.adrdel);
+          if (error) { b.disabled = false; return toast(error.message, "err"); }
+          drawAdr();
+        });
+      };
+      drawAdr();
+      $("#adr-add").onclick = async () => {
+        const lib = $("#adr-lib").value.trim(), txt = $("#adr-txt").value.trim();
+        if (!txt) return toast("Saisis au moins l'adresse", "err");
+        const btn = $("#adr-add"); btn.disabled = true;
+        const { error } = await sb.from("client_adresses").insert({ client_id: id, libelle: lib || null, adresse: txt });
+        btn.disabled = false;
+        if (error) return toast(error.message, "err");
+        $("#adr-lib").value = ""; $("#adr-txt").value = "";
+        drawAdr();
+      };
+      attachBAN($("#adr-txt"));
+    }
+    attachBAN($("#c-adr"));
+    attachBAN($("#c-adrliv"));
+
+    $("#save").onclick = async () => {
+      const nom = $("#c-nom").value.trim();
+      if (!nom) return toast("Ajoute un nom", "err");
+      const payload = {
+        nom,
+        type_client: $("#c-type").value,
+        adresse: $("#c-adr").value.trim() || null,
+        adresse_livraison: $("#c-adrliv").value.trim() || null,
+        contact_livraison: $("#c-contactliv").value.trim() || null,
+        acces: $("#c-acces").value.trim() || null,
+        contact: $("#c-contact").value.trim() || null,
+        email: $("#c-email").value.trim() || null,
+        telephone: $("#c-tel").value.trim() || null,
+        categorie: $("#c-cat").value.trim() || null,
+        groupe: $("#c-groupe").value.trim() || null,
+        titulaire: $("#c-titulaire").value.trim() || null,
+        sextan_id: $("#c-sextan").value.trim() || null,
+        sync_exclure: $("#c-syncexcl").checked,
+        sextan_auto: false, // enregistrer une fiche = validée (sort de la liste « à valider »)
+      };
+      $("#save").disabled = true;
+      if (isNew) {
+        const { data, error } = await sb.from("clients").insert(payload).select().single();
+        if (error) { $("#save").disabled = false; return toast(error.message, "err"); }
+        go("client/" + data.id);
+      } else {
+        const { error } = await sb.from("clients").update(payload).eq("id", id);
+        $("#save").disabled = false;
+        toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
+        if (!error) go("client/" + id);
+      }
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Paramètres
+  // =========================================================================
+  async function viewParametres() {
+    const compta = await db.param("email_compta");
+    app.innerHTML =
+      topbar("Paramètres", { back: "compte" }) +
+      `<main>
+        <div class="card">
+          <label>Email du service comptabilité</label>
+          <input id="p-compta" type="email" value="${esc(compta)}" placeholder="compta@briffe.me" />
+          <div class="sub" style="margin-top:6px">Destinataire des manquants à facturer pour les clients ponctuels.</div>
+          <button class="btn block" id="p-save">Enregistrer</button>
+        </div>
+      </main>`;
+    $("#p-save").onclick = async () => {
+      const { error } = await db.setParam("email_compta", $("#p-compta").value.trim());
+      toast(error ? error.message : "Enregistré ✔", error ? "err" : "ok");
+    };
+  }
+
+  // =========================================================================
+  //  VUE : Compte
+  // =========================================================================
+  async function viewCompte() {
+    app.innerHTML =
+      topbar("Mon compte") +
+      `<main>
+        <div class="card">
+          <h3>${esc(state.profile?.nom || state.user.email)}</h3>
+          <div class="sub">${esc(state.user.email)} · ${esc(state.profile?.role || "livreur")}</div>
+        </div>
+        <button class="btn sec block" onclick="location.hash='#/parametres'">⚙️ Paramètres</button>
+        <button class="btn ghost block" id="logout">Se déconnecter</button>
+        <div class="sub" style="text-align:center;margin-top:24px">GreenLoop · v2.6</div>
+      </main>`;
+    $("#logout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
+  }
+
+  // =========================================================================
+  //  AUTHENTIFICATION
+  // =========================================================================
+  function renderAuth(mode = "login") {
+    nav.classList.add("hidden");
+    const isSignup = mode === "signup";
+    app.innerHTML = `
+      <div class="login-wrap">
+        <div class="login-logo"><span class="leaf">🌿</span> GreenLoop</div>
+        <div class="login-sub">Traçabilité du matériel · BRIFFE</div>
+        <div class="card">
+          ${isSignup ? `<label>Nom</label><input id="a-nom" placeholder="Ton nom" />` : ""}
+          <label>Email</label><input id="a-email" type="email" autocomplete="email" placeholder="livreur@briffe.me" />
+          <label>Mot de passe</label><input id="a-pass" type="password" autocomplete="current-password" placeholder="••••••••" />
+          <button class="btn block" id="a-go">${isSignup ? "Créer le compte" : "Se connecter"}</button>
+          <button class="btn ghost block" id="a-switch">${isSignup ? "J'ai déjà un compte" : "Créer un compte"}</button>
+        </div>
+      </div>`;
+    $("#a-switch").onclick = () => renderAuth(isSignup ? "login" : "signup");
+    $("#a-go").onclick = async () => {
+      const email = $("#a-email").value.trim();
+      const pass = $("#a-pass").value;
+      if (!email || !pass) return toast("Email et mot de passe requis", "err");
+      $("#a-go").disabled = true;
+      if (isSignup) {
+        const { error } = await sb.auth.signUp({
+          email, password: pass, options: { data: { nom: $("#a-nom")?.value.trim() || email } },
+        });
+        $("#a-go").disabled = false;
+        if (error) return toast(error.message, "err");
+        toast("Compte créé ! Connecte-toi.", "ok");
+        renderAuth("login");
+      } else {
+        const { error } = await sb.auth.signInWithPassword({ email, password: pass });
+        $("#a-go").disabled = false;
+        if (error) return toast(error.message, "err");
+        boot();
+      }
+    };
+  }
+
+  // =========================================================================
+  //  DÉMARRAGE
+  // =========================================================================
+  async function boot() {
+    if (!CONFIGURED) {
+      app.innerHTML = `<div class="login-wrap">
+        <div class="login-logo"><span class="leaf">🌿</span> GreenLoop</div>
+        <div class="card">
+          <h3>Configuration requise</h3>
+          <p class="sub">Ouvre le fichier <b>config.js</b> et renseigne l'URL et la clé anon de ton projet Supabase, puis recharge. Le guide d'installation détaille chaque étape.</p>
+        </div></div>`;
+      return;
+    }
+    const { data } = await sb.auth.getUser();
+    if (!data.user) return renderAuth("login");
+    state.user = data.user;
+    const { data: prof } = await sb.from("profiles").select("*").eq("id", data.user.id).maybeSingle();
+    state.profile = prof;
+    // Compte désactivé par un admin -> accès bloqué
+    if (prof && prof.actif === false) {
+      await sb.auth.signOut();
+      app.innerHTML = `<div class="login-wrap">
+        <div class="login-logo"><span class="leaf">🌿</span> GreenLoop</div>
+        <div class="card"><h3>Compte désactivé</h3>
+          <p class="sub">Ton accès a été désactivé par un administrateur. Contacte ton responsable si c'est une erreur.</p>
+          <button class="btn block" onclick="location.reload()">Retour à la connexion</button>
+        </div></div>`;
+      return;
+    }
+    // Onglet Admin (uniquement pour les admins)
+    if (isAdmin() && !$("#nav-admin")) {
+      const b = document.createElement("button");
+      b.id = "nav-admin";
+      b.dataset.route = "admin";
+      b.innerHTML = '<span class="ico">🔐</span>Admin';
+      nav.appendChild(b);
+    }
+    if (!location.hash) location.hash = "#/prestations";
+    render();
+  }
+
+  // Service worker (PWA installable / hors-ligne léger)
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+  }
+
+  boot();
+})();
