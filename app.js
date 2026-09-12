@@ -198,8 +198,10 @@
         if (sub === "recuperation") return viewRecuperation(id);
         if (sub === "manquants") return viewManquants(id);
         if (sub === "edit") return viewPrestaEdit(id);
+        if (sub === "labels") return viewPrestaLabels(id);
         return viewPrestationDetail(id);
       }
+      if (head === "scan") return viewScan();
       if (head === "nouvelle-presta") return viewPrestaForm();
       if (head === "materiel" && parts.length === 1) return viewMateriel();
       if (head === "ecarts") return viewEcarts();
@@ -334,6 +336,74 @@
     };
   }
 
+  // Remplit le menu « reprendre une adresse enregistrée » (#f-lieu-pick) depuis
+  // les adresses du client, et recopie le choix dans le champ texte #f-lieu.
+  async function loadAddrOptions(clientId) {
+    const sel = $("#f-lieu-pick"); if (!sel) return;
+    if (!clientId) { sel.innerHTML = '<option value="">— choisis d\'abord un client —</option>'; return; }
+    const { data } = await sb.from("client_adresses").select("*").eq("client_id", clientId).order("created_at");
+    const list = data || [];
+    sel.innerHTML = '<option value="">— reprendre une adresse enregistrée du client —</option>' +
+      list.map((a) => `<option value="${esc(a.adresse || "")}">${esc(a.libelle ? a.libelle + " — " : "")}${esc(a.adresse || "")}</option>`).join("");
+  }
+  function wireLieuPicker(getClientId, initialClientId) {
+    const sel = $("#f-lieu-pick"), txt = $("#f-lieu");
+    if (!sel) return;
+    let loadedFor = "INIT";
+    const reload = async () => {
+      const cid = (getClientId && getClientId()) || initialClientId || "";
+      if (cid !== loadedFor) { loadedFor = cid; await loadAddrOptions(cid); }
+    };
+    reload();
+    sel.addEventListener("mousedown", reload);
+    sel.addEventListener("change", () => { if (sel.value && txt) txt.value = sel.value; });
+  }
+
+  // Autocomplétion d'adresse via la Base Adresse Nationale (api-adresse.data.gouv.fr,
+  // publique, sans clé). Propose des adresses pendant la frappe, sans empêcher la
+  // saisie libre (adresses complexes forcées à la main).
+  function attachBAN(input) {
+    if (!input || input.dataset.ban) return;
+    input.dataset.ban = "1";
+    input.setAttribute("autocomplete", "off");
+    const wrap = document.createElement("div");
+    wrap.style.position = "relative";
+    input.parentNode.insertBefore(wrap, input);
+    wrap.appendChild(input);
+    const box = document.createElement("div");
+    box.style.cssText = "position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:60;background:#fff;border:1px solid var(--line);border-radius:11px;max-height:240px;overflow:auto;box-shadow:0 6px 20px rgba(0,0,0,.14);display:none";
+    wrap.appendChild(box);
+    let t = null, lastQ = "";
+    const hide = () => { box.style.display = "none"; };
+    const show = () => { if (box.childNodes.length) box.style.display = "block"; };
+    const fill = (feats) => {
+      box.innerHTML = "";
+      feats.forEach((f) => {
+        const label = f.properties && f.properties.label; if (!label) return;
+        const row = document.createElement("div");
+        row.textContent = label;
+        row.style.cssText = "padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer;font-size:14px";
+        row.onmousedown = (e) => { e.preventDefault(); input.value = label; hide(); input.dispatchEvent(new Event("change", { bubbles: true })); };
+        box.appendChild(row);
+      });
+      show();
+    };
+    const query = async () => {
+      const q = input.value.trim();
+      if (q.length < 3) { hide(); return; }
+      if (q === lastQ) return; lastQ = q;
+      try {
+        const r = await fetch("https://api-adresse.data.gouv.fr/search/?limit=5&autocomplete=1&q=" + encodeURIComponent(q));
+        if (!r.ok) return;
+        const j = await r.json();
+        if ((j.features || []).length) fill(j.features); else hide();
+      } catch (_e) { /* hors-ligne : la saisie libre reste possible */ }
+    };
+    input.addEventListener("input", () => { clearTimeout(t); t = setTimeout(query, 250); });
+    input.addEventListener("focus", () => { if (box.childNodes.length) show(); });
+    input.addEventListener("blur", () => setTimeout(hide, 200));
+  }
+
   // =========================================================================
   //  VUE : Liste des prestations
   // =========================================================================
@@ -389,6 +459,7 @@
           <button type="button" class="ptag" data-tag="" style="${chipCss(true)}">Tout (${list.length})</button>
           ${presentTags.map((t) => `<button type="button" class="ptag" data-tag="${esc(t)}" style="${chipCss(false)}">${esc(t)} (${tagCount[t]})</button>`).join("")}
         </div>` : ""}
+        <button class="btn sec block" id="pscan" style="margin-bottom:10px">📷 Scanner une étiquette de prestation</button>
         <div class="row between" style="margin:2px 2px 10px">
           <div class="sub">Par journée de livraison</div>
           <button class="btn sm sec" id="psort" style="width:auto">📅 Plus proches d'abord ↑</button>
@@ -407,6 +478,7 @@
       <button class="fab" onclick="location.hash='#/nouvelle-presta'">＋</button>`;
 
     if ($("#tb-action")) $("#tb-action").onclick = () => go("archivees");
+    if ($("#pscan")) $("#pscan").onclick = () => go("scan");
 
     let activeTag = "";
     let sortAsc = true; // true = plus proches d'abord
@@ -707,6 +779,9 @@
             <div><label>Date de livraison</label><input id="f-date" type="date" value="${new Date().toISOString().slice(0,10)}" /></div>
             <div><label>Numéro</label><input id="f-ref" placeholder="N° dossier" /></div>
           </div>
+          <label>Lieu de livraison (étiquettes)</label>
+          <input id="f-lieu" placeholder="Adresse / lieu de livraison" />
+          <select id="f-lieu-pick" style="margin-top:6px"><option value="">— reprendre une adresse enregistrée du client —</option></select>
           <label>Nombre de convives (pré-remplissage sortie)</label>
           <input id="f-pax" type="number" min="0" placeholder="ex : 45" />
           <label>Notes</label>
@@ -715,6 +790,8 @@
         </div>
       </main>`;
     clientPickerWire(clients);
+    wireLieuPicker(() => $("#f-client") && $("#f-client").value, "");
+    attachBAN($("#f-lieu"));
     $("#save").onclick = async () => {
       const lib = $("#f-lib").value.trim();
       if (!lib) return toast("Ajoute un libellé", "err");
@@ -726,6 +803,7 @@
           client_id: $("#f-client").value || null,
           date_presta: $("#f-date").value || null,
           reference: $("#f-ref").value.trim() || null,
+          lieu_livraison: $("#f-lieu").value.trim() || null,
           pax: parseInt($("#f-pax").value) || null,
           notes: $("#f-notes").value.trim() || null,
           source: "manuel",
@@ -759,6 +837,9 @@
             <div><label>Date de livraison</label><input id="f-date" type="date" value="${p.date_presta ? String(p.date_presta).slice(0,10) : ""}" /></div>
             <div><label>Numéro</label><input id="f-ref" value="${esc(p.reference || "")}" placeholder="N° dossier" /></div>
           </div>
+          <label>Lieu de livraison (étiquettes)</label>
+          <input id="f-lieu" value="${esc(p.lieu_livraison || "")}" placeholder="Adresse / lieu de livraison" />
+          <select id="f-lieu-pick" style="margin-top:6px"><option value="">— reprendre une adresse enregistrée du client —</option></select>
           <label>Statut</label>
           <select id="f-statut">
             ${Object.keys(STATUT_LABEL).map((s) => `<option value="${s}" ${p.statut === s ? "selected" : ""}>${esc(STATUT_LABEL[s])}</option>`).join("")}
@@ -774,6 +855,8 @@
         <div class="card"><div class="sub">Modifier le client ou la date ne change pas les mouvements de matériel déjà enregistrés. Pour corriger les quantités sorties/récupérées, utilise « Revoir la sortie » / « Récupération » sur la fiche.</div></div>
       </main>`;
     clientPickerWire(clients);
+    wireLieuPicker(() => $("#f-client") && $("#f-client").value, p.client_id);
+    attachBAN($("#f-lieu"));
     $("#save").onclick = async () => {
       const lib = $("#f-lib").value.trim();
       if (!lib) return toast("Ajoute un libellé", "err");
@@ -787,6 +870,7 @@
         notes: $("#f-notes").value.trim() || null,
         pax: parseInt($("#f-pax").value) || null,
         consignerie_url: $("#f-consurl").value.trim() || null,
+        lieu_livraison: $("#f-lieu").value.trim() || null,
       }).eq("id", id);
       $("#save").disabled = false;
       toast(error ? error.message : "Prestation modifiée ✔", error ? "err" : "ok");
@@ -824,6 +908,8 @@
           <div class="box"><div class="n">${totalSortie}</div><div class="l">Sortis</div></div>
           <div class="box"><div class="n green">${totalRetour}</div><div class="l">Revenus</div></div>
         </div>
+
+        <button class="btn sec block" style="margin-bottom:6px" onclick="location.hash='#/prestation/${id}/labels'">🏷️ Étiquettes de préparation</button>
 
         <div class="section-title">Étape en cours</div>
         <div id="workflow"></div>
@@ -2035,7 +2121,8 @@ Total : ${eur(total)} HT`;
             <div class="field-row" style="margin-top:8px">
               <div><label style="margin-top:0">Rôle</label>
                 <select class="u-role">
-                  <option value="livreur" ${u.role !== "admin" ? "selected" : ""}>Livreur</option>
+                  <option value="livreur" ${(u.role !== "admin" && u.role !== "preparateur") ? "selected" : ""}>Livreur</option>
+                  <option value="preparateur" ${u.role === "preparateur" ? "selected" : ""}>Préparateur</option>
                   <option value="admin" ${u.role === "admin" ? "selected" : ""}>Administrateur</option>
                 </select></div>
               <div><label style="margin-top:0">Accès</label>
@@ -2484,6 +2571,91 @@ Total : ${eur(total)} HT`;
     };
     $("#apply").onclick = render;
     render();
+  }
+
+  // =========================================================================
+  //  VUE : Étiquettes de préparation d'une prestation (QR + infos, 62 mm)
+  //  Accès : tous les comptes connectés (livreurs, préparateurs, admin).
+  // =========================================================================
+  async function viewPrestaLabels(id) {
+    const p = await db.prestation(id);
+    const cli = p.clients || {};
+    const lieu = p.lieu_livraison || cli.adresse_livraison || cli.adresse || "";
+    const bl = p.reference || p.ext_ref || "";
+    const url = location.origin + location.pathname + "#/prestation/" + id;
+    const plabelCss = `
+      <style>
+        .plabels{display:flex;flex-direction:column;align-items:center;gap:12px;margin-top:12px}
+        .plabel{width:62mm;box-sizing:border-box;border:1px dashed var(--line);border-radius:8px;
+          padding:3mm;display:flex;flex-direction:column;align-items:center;text-align:center;background:#fff;color:#111}
+        .plabel .pcli{font-weight:800;font-size:13px;line-height:1.15;margin-bottom:1mm}
+        .plabel .plieu{font-size:11px;line-height:1.2;margin-bottom:1mm}
+        .plabel .pmeta{font-size:11px;font-weight:700;margin-bottom:2mm}
+        .plabel canvas,.plabel img{width:34mm !important;height:34mm !important}
+        .plabel .pbl{font-family:monospace;font-size:10px;margin-top:1mm;word-break:break-all}
+        @media print{
+          .plabels{display:block;margin:0}
+          .plabel{width:62mm;border:0;border-radius:0;page-break-after:always;break-after:page;padding:3mm}
+          .plabel:last-child{page-break-after:auto}
+        }
+      </style>`;
+    app.innerHTML =
+      topbar("Étiquettes · " + (p.libelle || ""), { back: "prestation/" + id, action: "🖨️ Imprimer" }) +
+      plabelCss +
+      `<main>
+        <div class="card no-print">
+          <div class="sub">Étiquettes à coller sur les caisses de préparation. Chaque étiquette porte le lieu, la date, le n° de dossier et un <b>QR</b> qui ouvre la fiche prestation quand on le scanne.</div>
+          <label>Nombre d'étiquettes</label>
+          <div class="field-row">
+            <input id="nb" type="number" value="2" min="1" max="50" />
+            <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
+          </div>
+          <div class="sub" style="margin-top:8px">💡 Imprimante <b>Brother</b>, rouleau continu <b>62 mm</b>, échelle 100 %.</div>
+          ${!lieu ? `<div class="sub" style="margin-top:8px;color:var(--danger)">⚠️ Aucun lieu de livraison sur cette prestation. Ajoute-le via « Modifier » ou dans la fiche client.</div>` : ""}
+        </div>
+        <div class="plabels" id="plabels"></div>
+      </main>`;
+    $("#tb-action").onclick = () => window.print();
+
+    const dateStr = dfr(p.date_presta);
+    const draw = () => {
+      const n = Math.min(50, Math.max(1, parseInt($("#nb").value) || 1));
+      const box = $("#plabels"); box.innerHTML = "";
+      for (let i = 0; i < n; i++) {
+        const div = document.createElement("div");
+        div.className = "plabel";
+        div.insertAdjacentHTML("beforeend",
+          `<div class="pcli">${esc(cli.nom || p.libelle || "Prestation")}</div>` +
+          (lieu ? `<div class="plieu">📍 ${esc(lieu)}</div>` : "") +
+          `<div class="pmeta">${esc(dateStr)}${bl ? " · N° " + esc(bl) : ""}</div>`);
+        const qr = document.createElement("div");
+        div.appendChild(qr);
+        if (bl) div.insertAdjacentHTML("beforeend", `<div class="pbl">${esc(bl)}</div>`);
+        box.appendChild(div);
+        new QRCode(qr, { text: url, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
+      }
+    };
+    $("#apply").onclick = draw;
+    draw();
+  }
+
+  // =========================================================================
+  //  VUE : Scanner un QR de prestation -> ouvre la fiche
+  // =========================================================================
+  async function viewScan() {
+    app.innerHTML =
+      topbar("Scanner une prestation", { back: "prestations" }) +
+      `<main>
+        <div class="card"><div class="sub">Vise le <b>QR d'une étiquette de prestation</b> pour ouvrir sa fiche directement.</div></div>
+        <div id="scanner-box"></div>
+        <div id="scan-hint" class="sub" style="text-align:center;margin-top:8px">Initialisation de la caméra…</div>
+      </main>`;
+    startScanner((decoded) => {
+      const m = String(decoded).match(/prestation\/([0-9a-fA-F-]{36})/);
+      if (m) { stopScanner(); go("prestation/" + m[1]); return; }
+      const hint = $("#scan-hint");
+      if (hint) hint.textContent = "QR non reconnu comme prestation. Réessaie.";
+    });
   }
 
   // =========================================================================
@@ -3032,6 +3204,17 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
           <div class="sub" style="margin-top:2px">Coché : les événements Sextan de ce client ne sont PAS importés (ex. La consignerie, dont les appels d'offre passent par briffetools).</div>
           <button class="btn block" id="save" style="margin-top:12px">${isNew ? "Créer" : "Enregistrer"}</button>
         </div>
+        ${isNew ? `<div class="card"><div class="sub">💡 Enregistre d'abord le client : tu pourras ensuite ajouter plusieurs adresses de livraison.</div></div>`
+          : `<div class="card">
+              <div class="section-title" style="margin-top:0">Adresses de livraison</div>
+              <div class="sub" style="margin-bottom:8px">Plusieurs lieux possibles pour ce client. Elles alimentent le choix du lieu sur chaque prestation et les étiquettes.</div>
+              <div id="adr-list"></div>
+              <div class="field-row" style="margin-top:8px">
+                <div><label style="margin-top:0">Libellé</label><input id="adr-lib" placeholder="ex. Site EuraTech" /></div>
+                <div style="flex:2"><label style="margin-top:0">Adresse</label><input id="adr-txt" placeholder="Adresse complète de livraison" /></div>
+              </div>
+              <button class="btn sec block" id="adr-add" style="margin-top:8px">➕ Ajouter cette adresse</button>
+            </div>`}
       </main>`;
 
     // suggestions de catégories déjà utilisées
@@ -3040,6 +3223,41 @@ Total : ${totalPieces} pièce(s), soit ${eur(totalValeur)} HT à facturer.`;
       const dl = $("#cat-list");
       if (dl) dl.innerHTML = cats.map((c) => `<option value="${esc(c)}"></option>`).join("");
     }).catch(() => {});
+
+    // Adresses de livraison multiples (client existant)
+    if (!isNew) {
+      const drawAdr = async () => {
+        const box = $("#adr-list"); if (!box) return;
+        const { data } = await sb.from("client_adresses").select("*").eq("client_id", id).order("created_at");
+        const list = data || [];
+        box.innerHTML = list.length
+          ? list.map((a) => `<div class="row between" style="gap:8px;padding:7px 0;border-bottom:1px solid var(--line)">
+              <div class="grow"><b>${esc(a.libelle || "Adresse")}</b><div class="sub">${esc(a.adresse || "")}</div></div>
+              <button class="btn sm danger" data-adrdel="${a.id}" style="flex:0 0 auto">✕</button>
+            </div>`).join("")
+          : `<div class="sub">Aucune adresse enregistrée pour l'instant.</div>`;
+        box.querySelectorAll("[data-adrdel]").forEach((b) => b.onclick = async () => {
+          b.disabled = true;
+          const { error } = await sb.from("client_adresses").delete().eq("id", b.dataset.adrdel);
+          if (error) { b.disabled = false; return toast(error.message, "err"); }
+          drawAdr();
+        });
+      };
+      drawAdr();
+      $("#adr-add").onclick = async () => {
+        const lib = $("#adr-lib").value.trim(), txt = $("#adr-txt").value.trim();
+        if (!txt) return toast("Saisis au moins l'adresse", "err");
+        const btn = $("#adr-add"); btn.disabled = true;
+        const { error } = await sb.from("client_adresses").insert({ client_id: id, libelle: lib || null, adresse: txt });
+        btn.disabled = false;
+        if (error) return toast(error.message, "err");
+        $("#adr-lib").value = ""; $("#adr-txt").value = "";
+        drawAdr();
+      };
+      attachBAN($("#adr-txt"));
+    }
+    attachBAN($("#c-adr"));
+    attachBAN($("#c-adrliv"));
 
     $("#save").onclick = async () => {
       const nom = $("#c-nom").value.trim();
