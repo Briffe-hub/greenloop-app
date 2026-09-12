@@ -170,8 +170,20 @@
     return raw.split("/").filter(Boolean); // ex: ["prestation","abc","sortie"]
   }
 
+  // Mémoire de défilement par écran (#hash) : permet de revenir à la liste
+  // exactement là où on l'avait quittée (ex. après avoir ouvert une prestation).
+  const scrollMem = {};
+  let curHash = location.hash || "#/prestations";
+  function restoreScroll() {
+    const y = scrollMem[location.hash];
+    requestAnimationFrame(() => { try { window.scrollTo(0, y || 0); } catch (_e) {} });
+  }
+
   async function render() {
     if (!state.user) return; // géré par renderAuth
+    // On sauvegarde la position de l'écran qu'on quitte AVANT de remplacer le DOM.
+    try { scrollMem[curHash] = window.scrollY; } catch (_e) {}
+    curHash = location.hash || "#/prestations";
     const parts = parseHash();
     const head = parts[0] || "prestations";
     setNav(head);
@@ -482,6 +494,7 @@
       draw();
     };
     draw();
+    restoreScroll(); // revient à la position quittée (retour depuis une prestation)
   }
 
   // =========================================================================
