@@ -2643,16 +2643,16 @@ Total : ${eur(total)} HT`;
       let body = ""; for (let i = 0; i < n; i++) body += one;
       const doc =
         `<!doctype html><html><head><meta charset="utf-8"><title>Étiquettes</title><style>` +
-        `@page{size:62mm auto;margin:0}` +
+        `@page{size:62mm 64mm;margin:0}` +
         `*{box-sizing:border-box}html,body{margin:0;padding:0}` +
         `body{font-family:system-ui,-apple-system,Arial,sans-serif;color:#000}` +
-        `.lbl{width:62mm;padding:3mm 2mm;text-align:center;page-break-after:always;break-after:page;display:flex;flex-direction:column;align-items:center;justify-content:flex-start}` +
+        `.lbl{width:62mm;height:64mm;overflow:hidden;padding:2mm;text-align:center;page-break-after:always;break-after:page;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.5mm}` +
         `.lbl:last-child{page-break-after:auto;break-after:auto}` +
-        `.cli{font-weight:800;font-size:13px;line-height:1.15}` +
-        `.lieu{font-size:11px;line-height:1.2;margin:1mm 0}` +
-        `.meta{font-weight:700;font-size:11px;margin-bottom:2mm}` +
-        `.lbl img{width:34mm;height:34mm;display:block}` +
-        `.bl{font-family:monospace;font-size:10px;margin-top:1mm;word-break:break-all}` +
+        `.cli{font-weight:800;font-size:12px;line-height:1.1}` +
+        `.lieu{font-size:10px;line-height:1.15;margin:0.5mm 0}` +
+        `.meta{font-weight:700;font-size:10px;margin-bottom:1mm}` +
+        `.lbl img{width:30mm;height:30mm;display:block}` +
+        `.bl{font-family:monospace;font-size:9px;margin-top:0.5mm;word-break:break-all}` +
         `</style></head><body>${body}</body></html>`;
       const ifr = document.createElement("iframe");
       ifr.setAttribute("aria-hidden", "true");
