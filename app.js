@@ -2610,12 +2610,106 @@ Total : ${eur(total)} HT`;
             <input id="nb" type="number" value="2" min="1" max="50" />
             <button class="btn sm" id="apply" style="flex:0 0 auto">Générer</button>
           </div>
-          <div class="sub" style="margin-top:8px">💡 Imprimante <b>Brother</b>, rouleau continu <b>62 mm</b>, échelle 100 %.</div>
+          <button class="btn block" id="btn-print" style="margin-top:10px">🖨️ Imprimer les étiquettes</button>
+          <button class="btn sec block" id="dl-png" style="margin-top:8px">📥 Enregistrer en image (dépannage)</button>
+          <div class="sub" style="margin-top:8px">Imprimante <b>Brother QL-810W</b>, rouleau continu <b>62 mm</b>. Au moment d'imprimer, choisis la Brother et le papier <b>« 62mm »</b>.<br>⚠️ Sur Android, le <b>service d'impression</b> doit être activé (Réglages → Impression). Si l'impression système refuse, utilise « Enregistrer en image » puis l'app <b>Brother iPrint&amp;Label</b>.</div>
           ${!lieu ? `<div class="sub" style="margin-top:8px;color:var(--danger)">⚠️ Aucun lieu de livraison sur cette prestation. Ajoute-le via « Modifier » ou dans la fiche client.</div>` : ""}
         </div>
         <div class="plabels" id="plabels"></div>
       </main>`;
-    $("#tb-action").onclick = () => window.print();
+
+    // QR en image (data URL) : plus fiable à l'impression qu'un canvas vivant.
+    const qrDataURL = () => {
+      const tmp = document.createElement("div");
+      new QRCode(tmp, { text: url, width: 320, height: 320, correctLevel: QRCode.CorrectLevel.M });
+      const c = tmp.querySelector("canvas");
+      if (c) { try { return c.toDataURL("image/png"); } catch (e) {} }
+      const im = tmp.querySelector("img");
+      return im ? im.src : "";
+    };
+    // Impression DIRECTE (sans téléchargement) : on écrit les étiquettes dans une
+    // iframe isolée, avec une vraie page 62 mm, puis on ouvre la boîte d'impression.
+    const printLabels = () => {
+      const n = Math.min(50, Math.max(1, parseInt($("#nb").value) || 1));
+      const qr = qrDataURL();
+      const one =
+        `<div class="lbl">` +
+        `<div class="cli">${esc(cli.nom || p.libelle || "Prestation")}</div>` +
+        (lieu ? `<div class="lieu">${esc(lieu)}</div>` : "") +
+        `<div class="meta">${esc(dateStr)}${bl ? " · N° " + esc(bl) : ""}</div>` +
+        (qr ? `<img src="${qr}" alt="">` : "") +
+        (bl ? `<div class="bl">${esc(bl)}</div>` : "") +
+        `</div>`;
+      let body = ""; for (let i = 0; i < n; i++) body += one;
+      const doc =
+        `<!doctype html><html><head><meta charset="utf-8"><title>Étiquettes</title><style>` +
+        `@page{size:62mm auto;margin:0}` +
+        `*{box-sizing:border-box}html,body{margin:0;padding:0}` +
+        `body{font-family:system-ui,-apple-system,Arial,sans-serif;color:#000}` +
+        `.lbl{width:62mm;padding:3mm 2mm;text-align:center;page-break-after:always;break-after:page;display:flex;flex-direction:column;align-items:center;justify-content:flex-start}` +
+        `.lbl:last-child{page-break-after:auto;break-after:auto}` +
+        `.cli{font-weight:800;font-size:13px;line-height:1.15}` +
+        `.lieu{font-size:11px;line-height:1.2;margin:1mm 0}` +
+        `.meta{font-weight:700;font-size:11px;margin-bottom:2mm}` +
+        `.lbl img{width:34mm;height:34mm;display:block}` +
+        `.bl{font-family:monospace;font-size:10px;margin-top:1mm;word-break:break-all}` +
+        `</style></head><body>${body}</body></html>`;
+      const ifr = document.createElement("iframe");
+      ifr.setAttribute("aria-hidden", "true");
+      ifr.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
+      document.body.appendChild(ifr);
+      const d = ifr.contentWindow.document;
+      d.open(); d.write(doc); d.close();
+      const fire = () => {
+        try { ifr.contentWindow.focus(); ifr.contentWindow.print(); }
+        catch (e) { try { window.print(); } catch (_e) {} }
+        setTimeout(() => { try { document.body.removeChild(ifr); } catch (e) {} }, 8000);
+      };
+      setTimeout(fire, 500); // la data URL est déjà chargée : court délai suffisant
+    };
+    if ($("#tb-action")) $("#tb-action").onclick = printLabels;
+    if ($("#btn-print")) $("#btn-print").onclick = printLabels;
+
+    // Génère l'étiquette en image PNG (Canvas) — voie fiable sur mobile (app Brother),
+    // indépendante du service d'impression Android qui « perd » l'imprimante.
+    const wrapText = (ctx, text, maxW) => {
+      const words = String(text).split(/\s+/), lines = []; let line = "";
+      words.forEach((w) => {
+        const t = line ? line + " " + w : w;
+        if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = w; } else line = t;
+      });
+      if (line) lines.push(line);
+      return lines;
+    };
+    const downloadLabelPNG = () => {
+      const S = 10, W = 62 * S, padX = 26, padY = 26, maxW = W - padX * 2, qrSize = 360;
+      const tmp = document.createElement("div");
+      new QRCode(tmp, { text: url, width: qrSize, height: qrSize, correctLevel: QRCode.CorrectLevel.M });
+      const qrEl = tmp.querySelector("canvas") || tmp.querySelector("img");
+      const mctx = document.createElement("canvas").getContext("2d");
+      mctx.font = "700 32px system-ui,Arial"; const cliLines = wrapText(mctx, cli.nom || p.libelle || "Prestation", maxW);
+      mctx.font = "24px system-ui,Arial"; const lieuLines = lieu ? wrapText(mctx, lieu, maxW) : [];
+      let h = padY + cliLines.length * 38 + 6 + lieuLines.length * 30 + 6 + 36 + 14 + qrSize + 16 + (bl ? 26 : 0) + padY;
+      const cv = document.createElement("canvas"); cv.width = W; cv.height = Math.round(h);
+      const ctx = cv.getContext("2d");
+      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, cv.height);
+      ctx.fillStyle = "#111"; ctx.textAlign = "center";
+      const finish = () => {
+        let y = padY + 32;
+        ctx.font = "700 32px system-ui,Arial"; cliLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 38; });
+        y += 6; ctx.font = "24px system-ui,Arial"; ctx.fillStyle = "#333"; lieuLines.forEach((l) => { ctx.fillText(l, W / 2, y); y += 30; });
+        y += 4; ctx.fillStyle = "#111"; ctx.font = "700 24px system-ui,Arial";
+        ctx.fillText(dateStr + (bl ? " · N° " + bl : ""), W / 2, y); y += 30;
+        if (qrEl) { try { ctx.drawImage(qrEl, (W - qrSize) / 2, y, qrSize, qrSize); } catch (e) {} y += qrSize + 20; }
+        if (bl) { ctx.font = "18px monospace"; ctx.fillStyle = "#444"; ctx.fillText(bl, W / 2, y); }
+        const data = cv.toDataURL("image/png");
+        const a = document.createElement("a");
+        a.href = data; a.download = "etiquette-" + String(bl || id).replace(/[^\w-]+/g, "_") + ".png";
+        document.body.appendChild(a); a.click(); a.remove();
+      };
+      if (qrEl && qrEl.tagName === "IMG" && !qrEl.complete) qrEl.onload = finish; else finish();
+    };
+    $("#dl-png").onclick = downloadLabelPNG;
 
     const dateStr = dfr(p.date_presta);
     const draw = () => {
